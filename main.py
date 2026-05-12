@@ -1,3 +1,4 @@
+import base64
 import os
 import io
 import requests
@@ -61,15 +62,20 @@ async def _decrypt_file_internal(file_path: str) -> dict:
 
 
 @mcp.tool()
-async def decrypt_file(file_path: str) -> dict:
+async def decrypt_file_to_base64(file_path: str) -> dict:
     """
-    解密文件并返回字节流（不写入磁盘）
+    解密文件并返回base64字符串（不写入磁盘）
 
       :param file_path: 要解密的文件路径（加密状态）
       :return: {"success": bool, "data": bytes, "error": str, "size": int}
     """
 
-    return _decrypt_file_internal(file_path)
+    result = await _decrypt_file_internal(file_path)
+
+    if result["success"] and result["data"]:
+        result["data"] = base64.b64encode(result["data"]).decode("utf-8")
+
+    return result
 
 
 @mcp.tool()
@@ -86,7 +92,7 @@ async def read_excel(file_path: str, sheet_name: Optional[str] = None) -> dict:
 
     try:
         # 1.解密到内存
-        decrypt_result = _decrypt_file_internal(file_path)
+        decrypt_result = await _decrypt_file_internal(file_path)
         if not decrypt_result["success"]:
             return {
                 "success": False,
@@ -138,7 +144,7 @@ async def read_pdf_text(file_path: str) -> dict:
     from PyPDF2 import PdfReader
 
     try:
-        decrypt_result = _decrypt_file_internal(file_path)
+        decrypt_result = await _decrypt_file_internal(file_path)
         if not decrypt_result["success"]:
             return {
                 "success": False,
@@ -179,7 +185,7 @@ async def filter_excel(file_path: str, column: str, value: str) -> dict:
     import pandas as pd
 
     try:
-        decrypt_result = _decrypt_file_internal(file_path)
+        decrypt_result = await _decrypt_file_internal(file_path)
         if not decrypt_result["success"]:
             return {
                 "success": False,
@@ -217,7 +223,7 @@ async def list_excel_sheets(file_path: str) -> dict:
     import pandas as pd
 
     try:
-        decrypt_result = _decrypt_file_internal(file_path)
+        decrypt_result = await _decrypt_file_internal(file_path)
         if not decrypt_result["success"]:
             return {"success": False, "sheets": None, "error": decrypt_result["error"]}
 
