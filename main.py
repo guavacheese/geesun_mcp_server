@@ -62,6 +62,35 @@ async def _decrypt_file_internal(file_path: str) -> dict:
 
 
 @mcp.tool()
+async def decrypt_to_tempfile(
+    file_path: str,
+    output_path: str,
+) -> dict:
+    """
+    解密文件并写入指定路径（/tmp下），供同机其他进程直接使用。
+    注意：调用方用完后负责清理临时文件。
+    :return: {"success": bool, "output_path": str, "error": str}
+    """
+
+    result = await _decrypt_file_internal(file_path)
+    if not result["success"]:
+        return {
+            "success": False,
+            "output_path": None,
+            "error": result["error"],
+        }
+
+    with open(output_path, "wb") as f:
+        f.write(result["data"])
+
+    return {
+        "success": True,
+        "output_path": output_path,
+        "error": None,
+    }
+
+
+@mcp.tool()
 async def decrypt_file_to_base64(file_path: str) -> dict:
     """
     解密文件并返回base64字符串（不写入磁盘）
