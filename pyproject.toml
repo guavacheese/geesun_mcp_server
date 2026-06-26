@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "e2b-code-interpreter>=2.8.1",
     "fastmcp>=3.2.4",
     "httpx>=0.28.1",
     "openpyxl>=3.1.5",

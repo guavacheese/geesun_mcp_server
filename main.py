@@ -6,11 +6,191 @@ from fastmcp import FastMCP
 from dotenv import load_dotenv
 from typing import Optional
 import httpx
+from e2b_code_interpreter import Sandbox as E2BSandbox
 
 load_dotenv()
 
 decrypt_api_url = os.getenv("DECRYPT_API_URL")
 mcp = FastMCP("decrypt-file")
+
+
+@mcp.tool()
+async def copy_script_to_sandbox(
+    script_name: str,
+    sandbox_path: str,
+    sandbox_id: str,
+    skill_name: str = "plc-code-auditor",
+) -> dict:
+    """
+    将 skill 脚本直传沙箱，不走 LLM 上下文。
+
+    Args:
+        script_name: 脚本文件名（如 plc_audit.py）
+        sandbox_path: 沙箱目标路径（如 /home/user/plc_audit.py）
+        sandbox_id: 沙箱 ID
+        skill_name: 技能名称（默认 plc-code-auditor）
+    """
+    # 从环境变量读取工作区根目录，不硬编码
+    agent_workspace = os.environ.get("AGENT_WORKSPACE", "")
+    if not agent_workspace:
+        return {"success": False, "error": "AGENT_WORKSPACE 未设置"}
+
+    script_path = f"{agent_workspace}/skills/{skill_name}/scripts/{script_name}"
+    if not os.path.isfile(script_path):
+        return {"success": False, "error": f"脚本不存在: {script_path}"}
+
+    with open(script_path, "rb") as f:
+        content = f.read()
+
+    # E2B API 连接配置
+    os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
+    os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY", ""))
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
+    if ssl_cert:
+        os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
+
+    sb = E2BSandbox.connect(sandbox_id)
+    try:
+        sb.files.write(sandbox_path, content)
+    except Exception as e:
+        return {
+            "success": False,
+            "sandbox_path": sandbox_path,
+            "size": 0,
+            "error": str(e),
+        }
+
+    return {"success": True, "sandbox_path": sandbox_path, "size": len(content)}
+
+
+@mcp.tool()
+async def upload_to_sandbox(
+    file_path: str,
+    remote_path: str,
+    sandbox_id: str,
+) -> dict:
+    """
+    上传宿主机的文件到沙箱（不解密），不经过 LLM 上下文。
+
+    适用于 XML、TXT 等不需要解密的文件。
+    文件从宿主机直传沙箱，不经过 LLM 上下文。
+
+    Args:
+        file_path: 虚拟路径（/uploads/...）或物理路径
+        remote_path: 沙箱内的目标路径（如 /home/user/data.xml）
+        sandbox_id: 目标沙箱 ID
+
+    Returns:
+        {"success": bool, "sandbox_path": str | None, "size": int, "error": str | None}
+    """
+    # 路径转换：虚拟路径 → 物理路径
+    if file_path.startswith("/uploads/"):
+        upload_root = os.environ.get("UPLOAD_ROOT", "")
+        if upload_root:
+            relative_path = file_path[len("/uploads/"):]
+            file_path = f"{upload_root}/{relative_path}"
+
+    try:
+        with open(file_path, "rb") as f:
+            content = f.read()
+    except Exception as e:
+        return {
+            "success": False,
+            "sandbox_path": None,
+            "size": 0,
+            "error": f"读取文件失败: {str(e)}",
+        }
+
+    # E2B API 连接配置
+    os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
+    os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY", ""))
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
+    if ssl_cert:
+        os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
+
+    sb = E2BSandbox.connect(sandbox_id)
+    try:
+        sb.files.write(remote_path, content)
+        return {
+            "success": True,
+            "sandbox_path": remote_path,
+            "size": len(content),
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "sandbox_path": None,
+            "size": 0,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
+async def decrypt_and_upload_to_sandbox(
+    file_path: str,
+    remote_path: str,
+    sandbox_id: str,
+) -> dict:
+    """
+    【推荐方式】解密文件并直接上传到 CubeSandbox 沙箱内。
+
+    解密后的明文会写入沙箱文件系统，不经过 LLM 上下文，不落地宿主机磁盘。
+
+    Args:
+        file_path: 加密文件的物理路径（如 /mnt/d/workspace/.../xxx.xlsx）
+        remote_path: 沙箱内的目标路径（如 /home/user/data.xlsx）
+        sandbox_id: 目标沙箱 ID，从聊天上下文的"沙箱 ID"字段获取
+
+    Returns:
+        {"success": bool, "sandbox_path": str | None, "size": int, "error": str | None}
+    """
+    # 路径转换：虚拟路径 → 物理路径
+    if file_path.startswith("/uploads/"):
+        # /uploads/{user_id}/{session_id}/{filename}
+        # → /mnt/d/workspace/geesun_agent/data/uploads/{user_id}/{session_id}/{filename}
+        upload_root = os.environ.get("UPLOAD_ROOT", "")
+        if upload_root:
+            # 去掉 /uploads/ 前缀，拼接物理路径
+            relative_path = file_path[len("/uploads/") :]
+            file_path = f"{upload_root}/{relative_path}"
+
+    # 1. 解密到内存
+    result = await _decrypt_file_internal(file_path)
+    if not result["success"]:
+        return {
+            "success": False,
+            "sandbox_path": None,
+            "size": 0,
+            "error": result["error"],
+        }
+
+    # E2B API 配置已通过 load_dotenv() 从 .env 加载到 os.environ
+    os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
+    os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY", ""))
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
+    if ssl_cert:
+        os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
+
+    sb = E2BSandbox.connect(sandbox_id)
+    try:
+        sb.files.write(remote_path, result["data"])
+        return {
+            "success": True,
+            "sandbox_path": remote_path,
+            "size": len(result["data"]),
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "sandbox_path": None,
+            "size": 0,
+            "error": str(e),
+        }
+    # ☝️ 注意：不调 sb.kill()，沙箱由 Agent 管理
+    #    connect 创建的对象会在函数返回后被 Python GC 回收
+    #    对 Agent 的沙箱无影响，文件已成功写入
 
 
 async def _decrypt_file_internal(file_path: str) -> dict:
@@ -88,6 +268,75 @@ async def decrypt_to_tempfile(
         "output_path": output_path,
         "error": None,
     }
+
+
+@mcp.tool()
+async def download_from_sandbox(
+    sandbox_id: str,
+    sandbox_path: str,
+    host_path: str,
+) -> dict:
+    """
+    从沙箱下载文件到宿主机，不经过 LLM 上下文。
+
+    沙箱内的文件（如审计报告）通过本工具直写宿主机磁盘，
+    不走 LLM 上下文，避免大内容撑爆 token。
+
+    Args:
+        sandbox_id: 沙箱 ID
+        sandbox_path: 沙箱内的文件路径（如 /home/user/plc_audit_report_xxx.md）
+        host_path: 宿主机目标路径。
+                   如果以 /reports/ 开头则自动转换为物理路径（$REPORT_ROOT/...），
+                   否则作为物理路径直接使用。
+
+    Returns:
+        {"success": bool, "host_path": str | None, "size": int, "error": str | None}
+    """
+    # 路径转换：虚拟 /reports/ 路径 → 物理路径
+    if host_path.startswith("/reports/"):
+        report_root = os.environ.get("REPORT_ROOT", "")
+        if report_root:
+            relative_path = host_path[len("/reports/"):]
+            host_path = f"{report_root}/{relative_path}"
+
+    # E2B API 连接配置
+    os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
+    os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY", ""))
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
+    if ssl_cert:
+        os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
+
+    sb = E2BSandbox.connect(sandbox_id)
+    try:
+        content = sb.files.read(sandbox_path, format="bytes")
+    except Exception as e:
+        return {
+            "success": False,
+            "host_path": None,
+            "size": 0,
+            "error": f"读取沙箱文件失败: {str(e)}",
+        }
+
+    # 写宿主机
+    try:
+        os.makedirs(os.path.dirname(host_path), exist_ok=True)
+        with open(host_path, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        return {
+            "success": False,
+            "host_path": host_path,
+            "size": 0,
+            "error": f"写入宿主机失败: {str(e)}",
+        }
+
+    return {
+        "success": True,
+        "host_path": host_path,
+        "size": len(content),
+        "error": None,
+    }
+    # ☝️ 注意：不调 sb.kill()，沙箱由 Agent 管理
 
 
 @mcp.tool()
