@@ -1,0 +1,5 @@
+feat: copy_script_to_sandbox 自动搜索所有 skill 来源目录
+
+- 移除 skill_source 参数，不再需要 LLM 指定来源
+- 自动按 __system__ → __agent__ → __user_*__ 顺序查找脚本
+- 找到的第一个匹配脚本直传沙箱，不经过 LLM 上下文

@@ -24,22 +24,44 @@ async def copy_script_to_sandbox(
     """
     将 skill 脚本直传沙箱，不走 LLM 上下文。
 
+    自动搜索所有 skill 来源目录（__system__ → __agent__ → __user_*__），
+    无需指定 skill_source。
+
     Args:
         script_name: 脚本文件名（如 plc_audit.py）
         sandbox_path: 沙箱目标路径（如 /home/user/plc_audit.py）
         sandbox_id: 沙箱 ID
         skill_name: 技能名称（默认 plc-code-auditor）
     """
-    # 从环境变量读取工作区根目录，不硬编码
     agent_workspace = os.environ.get("AGENT_WORKSPACE", "")
     if not agent_workspace:
         return {"success": False, "error": "AGENT_WORKSPACE 未设置"}
 
-    script_path = f"{agent_workspace}/skills/{skill_name}/scripts/{script_name}"
-    if not os.path.isfile(script_path):
-        return {"success": False, "error": f"脚本不存在: {script_path}"}
+    skills_base = f"{agent_workspace}/skills"
 
-    with open(script_path, "rb") as f:
+    # 收集所有 skill 来源目录：__system__ → __agent__ → 所有 __user_*__
+    source_dirs = ["__system__", "__agent__"]
+    if os.path.isdir(skills_base):
+        for entry in sorted(os.listdir(skills_base)):
+            if entry.startswith("__user_") and os.path.isdir(f"{skills_base}/{entry}"):
+                source_dirs.append(entry)
+
+    # 依次搜索，第一个找到的命中
+    found_path = None
+    for source in source_dirs:
+        test_path = f"{skills_base}/{source}/{skill_name}/scripts/{script_name}"
+        if os.path.isfile(test_path):
+            found_path = test_path
+            break
+
+    if not found_path:
+        return {
+            "success": False,
+            "error": f"在所有 skill 目录中均未找到 {skill_name}/scripts/{script_name}，"
+                     f"已搜索: {', '.join(source_dirs)}",
+        }
+
+    with open(found_path, "rb") as f:
         content = f.read()
 
     # E2B API 连接配置
