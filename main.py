@@ -17,8 +17,8 @@ mcp = FastMCP("decrypt-file")
 @mcp.tool()
 async def copy_script_to_sandbox(
     script_name: str,
-    sandbox_path: str,
     sandbox_id: str,
+    sandbox_path: str | None = None,
     skill_name: str = "plc-code-auditor",
 ) -> dict:
     """
@@ -29,10 +29,13 @@ async def copy_script_to_sandbox(
 
     Args:
         script_name: 脚本文件名（如 plc_audit.py）
-        sandbox_path: 沙箱目标路径（如 /home/user/plc_audit.py）
         sandbox_id: 沙箱 ID
+        sandbox_path: 沙箱目标路径（如 /home/user/plc_audit.py），
+                      不传则自动取 /home/user/{script_name}
         skill_name: 技能名称（默认 plc-code-auditor）
     """
+    if sandbox_path is None:
+        sandbox_path = f"/home/user/{script_name}"
     agent_workspace = os.environ.get("AGENT_WORKSPACE", "")
     if not agent_workspace:
         return {"success": False, "error": "AGENT_WORKSPACE 未设置"}
