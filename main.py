@@ -101,7 +101,7 @@ async def upload_to_sandbox(
     文件从宿主机直传沙箱，不经过 LLM 上下文。
 
     Args:
-        file_path: 虚拟路径（/uploads/...）或物理路径
+        file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}）
         remote_path: 沙箱内的目标路径（如 /home/user/data.xml）
         sandbox_id: 目标沙箱 ID
 
@@ -163,7 +163,7 @@ async def decrypt_and_upload_to_sandbox(
     解密后的明文会写入沙箱文件系统，不经过 LLM 上下文，不落地宿主机磁盘。
 
     Args:
-        file_path: 加密文件的物理路径（如 /mnt/d/workspace/.../xxx.xlsx）
+        file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}）
         remote_path: 沙箱内的目标路径（如 /home/user/data.xlsx）
         sandbox_id: 目标沙箱 ID，从聊天上下文的"沙箱 ID"字段获取
 
