@@ -1,6 +1,7 @@
 import base64
 import os
 import io
+import re
 import requests
 from fastmcp import FastMCP
 from dotenv import load_dotenv
@@ -295,6 +296,20 @@ async def decrypt_to_tempfile(
     }
 
 
+def _is_valid_sandbox_id(sandbox_id: str) -> bool:
+    """检查 sandbox_id 是否格式有效（32位hex或36位含横线UUID，且不含中文等占位文本）"""
+    sid = sandbox_id.strip()
+    if not sid:
+        return False
+    # 标准 UUID 格式 8-4-4-4-12（含横线）
+    if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', sid, re.I):
+        return True
+    # 32 位 hex（无横线）
+    if re.match(r'^[0-9a-f]{32}$', sid, re.I):
+        return True
+    return False
+
+
 @mcp.tool()
 async def download_from_sandbox(
     sandbox_id: str,
@@ -306,6 +321,9 @@ async def download_from_sandbox(
 
     沙箱内的文件（如审计报告）通过本工具直写宿主机磁盘，
     不走 LLM 上下文，避免大内容撑爆 token。
+
+    容错：如果文件已存在于 host_path 则直接返回成功（跳过沙箱连接），
+    适用于 AI 先用 write_file 写入 /reports/ 后又误调本工具的场景。
 
     Args:
         sandbox_id: 沙箱 ID
@@ -323,6 +341,27 @@ async def download_from_sandbox(
         if report_root:
             relative_path = host_path[len("/reports/"):]
             host_path = f"{report_root}/{relative_path}"
+
+    # ─── 容错1：文件已在宿主机上，跳过沙箱下载 ───
+    # 场景：AI 先用 write_file 写到 /reports/，文件已落盘，然后又调本工具
+    if os.path.isfile(host_path):
+        file_size = os.path.getsize(host_path)
+        return {
+            "success": True,
+            "host_path": host_path,
+            "size": file_size,
+            "error": None,
+        }
+
+    # ─── 容错2：sandbox_id 无效时，不尝试 E2B 连接 ───
+    # 场景：create_sandbox 失败（资源不足/超时等）导致 sandbox_id 为空或占位文本
+    if not _is_valid_sandbox_id(sandbox_id):
+        return {
+            "success": False,
+            "host_path": None,
+            "size": 0,
+            "error": f"sandbox_id 无效或为空: '{sandbox_id}'，且宿主机文件不存在: {host_path}",
+        }
 
     # E2B API 连接配置
     os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
