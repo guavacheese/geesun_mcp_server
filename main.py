@@ -14,6 +14,10 @@ load_dotenv()
 decrypt_api_url = os.getenv("DECRYPT_API_URL")
 mcp = FastMCP("decrypt-file")
 
+# v3.1 护栏：公司 DLP 加密文件头魔数。
+# 判断"文件是否加密"不靠扩展名（txt/py 也可能被加密），靠文件头特征。
+DLP_HEADER_SIGNATURES: tuple[bytes, ...] = (b"%TSD-Header",)
+
 
 @mcp.tool()
 async def copy_script_to_sandbox(
@@ -62,7 +66,7 @@ async def copy_script_to_sandbox(
         return {
             "success": False,
             "error": f"在所有 skill 目录中均未找到 {skill_name}/scripts/{script_name}，"
-                     f"已搜索: {', '.join(source_dirs)}",
+            f"已搜索: {', '.join(source_dirs)}",
         }
 
     with open(found_path, "rb") as f:
@@ -113,7 +117,7 @@ async def upload_to_sandbox(
     if file_path.startswith("/uploads/"):
         upload_root = os.environ.get("UPLOAD_ROOT", "")
         if upload_root:
-            relative_path = file_path[len("/uploads/"):]
+            relative_path = file_path[len("/uploads/") :]
             file_path = f"{upload_root}/{relative_path}"
 
     try:
@@ -125,6 +129,21 @@ async def upload_to_sandbox(
             "sandbox_path": None,
             "size": 0,
             "error": f"读取文件失败: {str(e)}",
+        }
+
+    # ── v3.1 护栏：DLP 加密文件（%TSD-Header 文件头）不得从明文通道上传 ──
+    # upload_to_sandbox 不解密，密文进沙箱后 AI 无法解析，纯浪费步数。
+    # 判断靠文件头（不靠扩展名）：txt/py 等文本类文件也可能被公司 DLP 加密。
+    if any(content.startswith(sig) for sig in DLP_HEADER_SIGNATURES):
+        return {
+            "success": False,
+            "sandbox_path": None,
+            "size": 0,
+            "error": (
+                f"检测到 '{file_path}' 是公司 DLP 加密文件（文件头 {DLP_HEADER_SIGNATURES[0].decode(errors='replace')}），"
+                "upload_to_sandbox 不解密，密文进沙箱后无法解析。"
+                "请改用 decrypt_and_upload_to_sandbox 解密后上传到沙箱。"
+            ),
         }
 
     # E2B API 连接配置
@@ -159,7 +178,11 @@ async def decrypt_and_upload_to_sandbox(
     sandbox_id: str,
 ) -> dict:
     """
-    【推荐方式】解密文件并直接上传到 CubeSandbox 沙箱内。
+    【唯一方式】读取被公司加密的文件：解密并直接上传到 CubeSandbox 沙箱内。
+
+    公司 DLP 会加密 PDF / Excel / Word，以及 txt、py 等任意文本类文件
+    （判断是否加密看文件头 %TSD-Header，不看扩展名）。
+    本工具是读取加密文件的唯一正确入口；upload_to_sandbox 会拒绝密文。
 
     解密后的明文会写入沙箱文件系统，不经过 LLM 上下文，不落地宿主机磁盘。
 
@@ -267,33 +290,33 @@ async def _decrypt_file_internal(file_path: str) -> dict:
         }
 
 
-@mcp.tool()
-async def decrypt_to_tempfile(
-    file_path: str,
-    output_path: str,
-) -> dict:
-    """
-    解密文件并写入指定路径（/tmp下），供同机其他进程直接使用。
-    注意：调用方用完后负责清理临时文件。
-    :return: {"success": bool, "output_path": str, "error": str}
-    """
+# @mcp.tool()
+# async def decrypt_to_tempfile(
+#     file_path: str,
+#     output_path: str,
+# ) -> dict:
+#     """
+#     解密文件并写入指定路径（/tmp下），供同机其他进程直接使用。
+#     注意：调用方用完后负责清理临时文件。
+#     :return: {"success": bool, "output_path": str, "error": str}
+#     """
 
-    result = await _decrypt_file_internal(file_path)
-    if not result["success"]:
-        return {
-            "success": False,
-            "output_path": None,
-            "error": result["error"],
-        }
+#     result = await _decrypt_file_internal(file_path)
+#     if not result["success"]:
+#         return {
+#             "success": False,
+#             "output_path": None,
+#             "error": result["error"],
+#         }
 
-    with open(output_path, "wb") as f:
-        f.write(result["data"])
+#     with open(output_path, "wb") as f:
+#         f.write(result["data"])
 
-    return {
-        "success": True,
-        "output_path": output_path,
-        "error": None,
-    }
+#     return {
+#         "success": True,
+#         "output_path": output_path,
+#         "error": None,
+#     }
 
 
 def _is_valid_sandbox_id(sandbox_id: str) -> bool:
@@ -302,10 +325,12 @@ def _is_valid_sandbox_id(sandbox_id: str) -> bool:
     if not sid:
         return False
     # 标准 UUID 格式 8-4-4-4-12（含横线）
-    if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', sid, re.I):
+    if re.match(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", sid, re.I
+    ):
         return True
     # 32 位 hex（无横线）
-    if re.match(r'^[0-9a-f]{32}$', sid, re.I):
+    if re.match(r"^[0-9a-f]{32}$", sid, re.I):
         return True
     return False
 
@@ -339,7 +364,7 @@ async def download_from_sandbox(
     if host_path.startswith("/reports/"):
         report_root = os.environ.get("REPORT_ROOT", "")
         if report_root:
-            relative_path = host_path[len("/reports/"):]
+            relative_path = host_path[len("/reports/") :]
             host_path = f"{report_root}/{relative_path}"
 
     # ─── 容错1：文件已在宿主机上，跳过沙箱下载 ───
@@ -403,21 +428,21 @@ async def download_from_sandbox(
     # ☝️ 注意：不调 sb.kill()，沙箱由 Agent 管理
 
 
-@mcp.tool()
-async def decrypt_file_to_base64(file_path: str) -> dict:
-    """
-    解密文件并返回base64字符串（不写入磁盘）
+# @mcp.tool()
+# async def decrypt_file_to_base64(file_path: str) -> dict:
+#     """
+#     解密文件并返回base64字符串（不写入磁盘）
 
-      :param file_path: 要解密的文件路径（加密状态）
-      :return: {"success": bool, "data": bytes, "error": str, "size": int}
-    """
+#       :param file_path: 要解密的文件路径（加密状态）
+#       :return: {"success": bool, "data": bytes, "error": str, "size": int}
+#     """
 
-    result = await _decrypt_file_internal(file_path)
+#     result = await _decrypt_file_internal(file_path)
 
-    if result["success"] and result["data"]:
-        result["data"] = base64.b64encode(result["data"]).decode("utf-8")
+#     if result["success"] and result["data"]:
+#         result["data"] = base64.b64encode(result["data"]).decode("utf-8")
 
-    return result
+#     return result
 
 
 @mcp.tool()
@@ -474,51 +499,51 @@ async def read_excel(file_path: str, sheet_name: Optional[str] = None) -> dict:
         }
 
 
-@mcp.tool()
-async def read_pdf_text(file_path: str) -> dict:
-    """
-    解密并提取 PDF 文本内容
+# @mcp.tool()
+# async def read_pdf_text(file_path: str) -> dict:
+#     """
+#     解密并提取 PDF 文本内容
 
-    :param file_path: PDF 文件路径（加密状态）
-    :return: {"success": bool, "text": str, "page_count": int, "error": str}
-    """
+#     :param file_path: PDF 文件路径（加密状态）
+#     :return: {"success": bool, "text": str, "page_count": int, "error": str}
+#     """
 
-    from PyPDF2 import PdfReader
+#     from PyPDF2 import PdfReader
 
-    try:
-        decrypt_result = await _decrypt_file_internal(file_path)
-        if not decrypt_result["success"]:
-            return {
-                "success": False,
-                "text": None,
-                "page_count": 0,
-                "error": decrypt_result["error"],
-            }
+#     try:
+#         decrypt_result = await _decrypt_file_internal(file_path)
+#         if not decrypt_result["success"]:
+#             return {
+#                 "success": False,
+#                 "text": None,
+#                 "page_count": 0,
+#                 "error": decrypt_result["error"],
+#             }
 
-        pdf_buffer = io.BytesIO(decrypt_result["data"])
-        reader = PdfReader(pdf_buffer)
+#         pdf_buffer = io.BytesIO(decrypt_result["data"])
+#         reader = PdfReader(pdf_buffer)
 
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
+#         text = ""
+#         for page in reader.pages:
+#             text += page.extract_text() + "\n"
 
-        page_count = len(reader.pages)
-        pdf_buffer.close()
+#         page_count = len(reader.pages)
+#         pdf_buffer.close()
 
-        return {
-            "success": True,
-            "text": text.strip(),
-            "page_count": page_count,
-            "error": None,
-        }
+#         return {
+#             "success": True,
+#             "text": text.strip(),
+#             "page_count": page_count,
+#             "error": None,
+#         }
 
-    except Exception as e:
-        return {
-            "success": False,
-            "text": None,
-            "page_count": 0,
-            "error": str(e),
-        }
+#     except Exception as e:
+#         return {
+#             "success": False,
+#             "text": None,
+#             "page_count": 0,
+#             "error": str(e),
+#         }
 
 
 @mcp.tool()
