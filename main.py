@@ -445,58 +445,58 @@ async def download_from_sandbox(
 #     return result
 
 
-@mcp.tool()
-async def read_excel(file_path: str, sheet_name: Optional[str] = None) -> dict:
-    """
-    解密并读取 Excel 文件，返回结构化数据
+# @mcp.tool()
+# async def read_excel(file_path: str, sheet_name: Optional[str] = None) -> dict:
+#     """
+#     解密并读取 Excel 文件，返回结构化数据
 
-    :param file_path: Excel 文件路径（加密状态）
-    :param sheet_name: 工作表名称，默认第一个
-    :return: {"success": bool, "data": list[dict], "columns": list, "error": str}
-    """
+#     :param file_path: Excel 文件路径（加密状态）
+#     :param sheet_name: 工作表名称，默认第一个
+#     :return: {"success": bool, "data": list[dict], "columns": list, "error": str}
+#     """
 
-    import pandas as pd
+#     import pandas as pd
 
-    try:
-        # 1.解密到内存
-        decrypt_result = await _decrypt_file_internal(file_path)
-        if not decrypt_result["success"]:
-            return {
-                "success": False,
-                "data": None,
-                "columns": None,
-                "row_count": 0,
-                "error": decrypt_result["error"],
-            }
+#     try:
+#         # 1.解密到内存
+#         decrypt_result = await _decrypt_file_internal(file_path)
+#         if not decrypt_result["success"]:
+#             return {
+#                 "success": False,
+#                 "data": None,
+#                 "columns": None,
+#                 "row_count": 0,
+#                 "error": decrypt_result["error"],
+#             }
 
-        # 2. 内存中读取 Excel
-        excel_buff = io.BytesIO(decrypt_result["data"])
+#         # 2. 内存中读取 Excel
+#         excel_buff = io.BytesIO(decrypt_result["data"])
 
-        if sheet_name:
-            df = pd.read_excel(excel_buff, sheet_name=sheet_name)
-        else:
-            df = pd.read_excel(excel_buff)
+#         if sheet_name:
+#             df = pd.read_excel(excel_buff, sheet_name=sheet_name)
+#         else:
+#             df = pd.read_excel(excel_buff)
 
-        # 3. 转换为结构化数据
-        data = df.fillna("").to_dict(orient="records")
-        columns = df.columns.to_list()
+#         # 3. 转换为结构化数据
+#         data = df.fillna("").to_dict(orient="records")
+#         columns = df.columns.to_list()
 
-        return {
-            "success": True,
-            "data": data,
-            "columns": columns,
-            "row_count": len(data),
-            "error": None,
-        }
+#         return {
+#             "success": True,
+#             "data": data,
+#             "columns": columns,
+#             "row_count": len(data),
+#             "error": None,
+#         }
 
-    except Exception as e:
-        return {
-            "success": False,
-            "data": None,
-            "columns": None,
-            "row_count": 0,
-            "error": str(e),
-        }
+#     except Exception as e:
+#         return {
+#             "success": False,
+#             "data": None,
+#             "columns": None,
+#             "row_count": 0,
+#             "error": str(e),
+#         }
 
 
 # @mcp.tool()
@@ -546,72 +546,72 @@ async def read_excel(file_path: str, sheet_name: Optional[str] = None) -> dict:
 #         }
 
 
-@mcp.tool()
-async def filter_excel(file_path: str, column: str, value: str) -> dict:
+# @mcp.tool()
+# async def filter_excel(file_path: str, column: str, value: str) -> dict:
 
-    import pandas as pd
+#     import pandas as pd
 
-    try:
-        decrypt_result = await _decrypt_file_internal(file_path)
-        if not decrypt_result["success"]:
-            return {
-                "success": False,
-                "data": None,
-                "row_count": 0,
-                "error": decrypt_result["error"],
-            }
+#     try:
+#         decrypt_result = await _decrypt_file_internal(file_path)
+#         if not decrypt_result["success"]:
+#             return {
+#                 "success": False,
+#                 "data": None,
+#                 "row_count": 0,
+#                 "error": decrypt_result["error"],
+#             }
 
-        excel_buff = io.BytesIO(decrypt_result["data"])
-        df = pd.read_excel(excel_buff)
-        excel_buff.close()
+#         excel_buff = io.BytesIO(decrypt_result["data"])
+#         df = pd.read_excel(excel_buff)
+#         excel_buff.close()
 
-        # 筛选
-        filtered = df[df[column].astype(str) == value]
+#         # 筛选
+#         filtered = df[df[column].astype(str) == value]
 
-        return {
-            "success": True,
-            "data": filtered.fillna("").to_dict(orient="records"),
-            "row_count": len(filtered),
-            "error": None,
-        }
+#         return {
+#             "success": True,
+#             "data": filtered.fillna("").to_dict(orient="records"),
+#             "row_count": len(filtered),
+#             "error": None,
+#         }
 
-    except Exception as e:
-        return {
-            "success": False,
-            "data": None,
-            "row_count": 0,
-            "error": str(e),
-        }
+#     except Exception as e:
+#         return {
+#             "success": False,
+#             "data": None,
+#             "row_count": 0,
+#             "error": str(e),
+#         }
 
 
-@mcp.tool()
-async def list_excel_sheets(file_path: str) -> dict:
+# @mcp.tool()
+# async def list_excel_sheets(file_path: str) -> dict:
 
-    import pandas as pd
+#     import pandas as pd
 
-    try:
-        decrypt_result = await _decrypt_file_internal(file_path)
-        if not decrypt_result["success"]:
-            return {"success": False, "sheets": None, "error": decrypt_result["error"]}
+#     try:
+#         decrypt_result = await _decrypt_file_internal(file_path)
+#         if not decrypt_result["success"]:
+#             return {"success": False, "sheets": None, "error": decrypt_result["error"]}
 
-        # 读取所有sheet名称
-        excel_buffer = io.BytesIO(decrypt_result["data"])
-        xl = pd.ExcelFile(excel_buffer)
-        sheet_names = xl.sheet_names
-        excel_buffer.close()
+#         # 读取所有sheet名称
+#         excel_buffer = io.BytesIO(decrypt_result["data"])
+#         xl = pd.ExcelFile(excel_buffer)
+#         sheet_names = xl.sheet_names
+#         excel_buffer.close()
 
-        return {
-            "success": True,
-            "sheets": sheet_names,
-            "error": None,
-        }
+#         return {
+#             "success": True,
+#             "sheets": sheet_names,
+#             "error": None,
+#         }
 
-    except Exception as e:
-        return {
-            "success": False,
-            "sheets": None,
-            "error": str(e),
-        }
+#     except Exception as e:
+#         return {
+#             "success": False,
+#             "sheets": None,
+#             "error": str(e),
+#         }
 
 
 if __name__ == "__main__":
