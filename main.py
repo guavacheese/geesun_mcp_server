@@ -29,21 +29,23 @@ async def copy_script_to_sandbox(
     """
     将 skill 脚本直传沙箱，不走 LLM 上下文。
 
-    自动搜索所有 skill 来源目录（__system__ → __agent__ → __user_*__），
+    自动搜索所有 skill 来源目录（__system__ → __agent__ → 所有 __user_*__），
     无需指定 skill_source。
 
-    ⚠️ skill_name 必须传"脚本实际所在 skill 名"：先 ls /skills/__agent__/
-    （或 /skills/__user_*__/）确认脚本在哪个 skill 下，再传入对应
-    skill_name，不要依赖默认值。例如 protocol-diff 的脚本要传
-    skill_name="protocol-diff"。若指定 skill 下未找到，会自动按
-    script_name 在全部 skill 中全局搜索兜底。
+    用法（无需猜测路径）：
+    - skill_name 通常【不必提供】——工具会按 script_name 在所有 skill
+      目录中全局搜索，唯一命中直接使用；
+    - 若同名脚本存在于多个 skill（返回 ambiguous + candidates 候选清单），
+      结合当前任务从候选清单中选定 skill_name 后重试一次即可；
+    - 仅当你明确脚本在哪个 skill 下时，才可显式传入 skill_name 加速定位。
 
     Args:
         script_name: 脚本文件名（如 extract_structure.py）
         sandbox_id: 沙箱 ID
         sandbox_path: 沙箱目标路径（如 /home/user/extract_structure.py），
                       不传则自动取 /home/user/{script_name}
-        skill_name: 脚本所在技能名（必须显式指定，勿依赖默认值）
+        skill_name: （可选）脚本所在技能名；不传则全局搜索唯一命中即用，
+                    多命中时按返回的 candidates 消歧后重试
     """
     if sandbox_path is None:
         sandbox_path = f"/home/user/{script_name}"
@@ -60,16 +62,18 @@ async def copy_script_to_sandbox(
             if entry.startswith("__user_") and os.path.isdir(f"{skills_base}/{entry}"):
                 source_dirs.append(entry)
 
-    # 依次搜索，第一个找到的命中
+    # ① 指定了 skill_name：仅在该 skill 下精确查找（最快路径）
     found_path = None
-    for source in source_dirs:
-        test_path = f"{skills_base}/{source}/{skill_name}/scripts/{script_name}"
-        if os.path.isfile(test_path):
-            found_path = test_path
-            break
+    if skill_name:
+        for source in source_dirs:
+            test_path = f"{skills_base}/{source}/{skill_name}/scripts/{script_name}"
+            if os.path.isfile(test_path):
+                found_path = test_path
+                break
 
+    # ② 未指定或指定 skill 下未找到 → 全局收集全部命中（不静默取首个）
     if not found_path:
-        # 兜底：指定 skill 下未找到 → 按 script_name 在全部 skill 中全局搜索
+        matches = []  # (source, skill_dir, path)
         for source in source_dirs:
             src = f"{skills_base}/{source}"
             if not os.path.isdir(src):
@@ -77,11 +81,27 @@ async def copy_script_to_sandbox(
             for skill_dir in sorted(os.listdir(src)):
                 candidate = f"{src}/{skill_dir}/scripts/{script_name}"
                 if os.path.isfile(candidate):
-                    found_path = candidate
-                    skill_name = skill_dir
-                    break
-            if found_path:
-                break
+                    matches.append((source, skill_dir, candidate))
+
+        if len(matches) == 1:
+            _source, skill_name, found_path = matches[0]
+        elif len(matches) > 1:
+            # 多命中：不静默选错，返回候选清单让 agent 基于事实决策
+            return {
+                "success": False,
+                "ambiguous": True,
+                "script_name": script_name,
+                "candidates": [
+                    {
+                        "skill_name": skill_dir,
+                        "source": source,
+                        "path": path,
+                        "size": os.path.getsize(path),
+                    }
+                    for source, skill_dir, path in matches
+                ],
+                "hint": "同名脚本存在于多个 skill，请结合当前任务指定 skill_name 后重试",
+            }
 
     if not found_path:
         return {
