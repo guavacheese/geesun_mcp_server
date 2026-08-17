@@ -24,7 +24,7 @@ async def copy_script_to_sandbox(
     script_name: str,
     sandbox_id: str,
     sandbox_path: str | None = None,
-    skill_name: str = "plc-code-auditor",
+    skill_name: str | None = None,
 ) -> dict:
     """
     将 skill 脚本直传沙箱，不走 LLM 上下文。
@@ -32,12 +32,18 @@ async def copy_script_to_sandbox(
     自动搜索所有 skill 来源目录（__system__ → __agent__ → __user_*__），
     无需指定 skill_source。
 
+    ⚠️ skill_name 必须传"脚本实际所在 skill 名"：先 ls /skills/__agent__/
+    （或 /skills/__user_*__/）确认脚本在哪个 skill 下，再传入对应
+    skill_name，不要依赖默认值。例如 protocol-diff 的脚本要传
+    skill_name="protocol-diff"。若指定 skill 下未找到，会自动按
+    script_name 在全部 skill 中全局搜索兜底。
+
     Args:
-        script_name: 脚本文件名（如 plc_audit.py）
+        script_name: 脚本文件名（如 extract_structure.py）
         sandbox_id: 沙箱 ID
-        sandbox_path: 沙箱目标路径（如 /home/user/plc_audit.py），
+        sandbox_path: 沙箱目标路径（如 /home/user/extract_structure.py），
                       不传则自动取 /home/user/{script_name}
-        skill_name: 技能名称（默认 plc-code-auditor）
+        skill_name: 脚本所在技能名（必须显式指定，勿依赖默认值）
     """
     if sandbox_path is None:
         sandbox_path = f"/home/user/{script_name}"
@@ -63,9 +69,24 @@ async def copy_script_to_sandbox(
             break
 
     if not found_path:
+        # 兜底：指定 skill 下未找到 → 按 script_name 在全部 skill 中全局搜索
+        for source in source_dirs:
+            src = f"{skills_base}/{source}"
+            if not os.path.isdir(src):
+                continue
+            for skill_dir in sorted(os.listdir(src)):
+                candidate = f"{src}/{skill_dir}/scripts/{script_name}"
+                if os.path.isfile(candidate):
+                    found_path = candidate
+                    skill_name = skill_dir
+                    break
+            if found_path:
+                break
+
+    if not found_path:
         return {
             "success": False,
-            "error": f"在所有 skill 目录中均未找到 {skill_name}/scripts/{script_name}，"
+            "error": f"在所有 skill 目录中均未找到 {script_name}，"
             f"已搜索: {', '.join(source_dirs)}",
         }
 
@@ -428,21 +449,21 @@ async def download_from_sandbox(
     # ☝️ 注意：不调 sb.kill()，沙箱由 Agent 管理
 
 
-# @mcp.tool()
-# async def decrypt_file_to_base64(file_path: str) -> dict:
-#     """
-#     解密文件并返回base64字符串（不写入磁盘）
+@mcp.tool()
+async def decrypt_file_to_base64(file_path: str) -> dict:
+    """
+    解密文件并返回base64字符串（不写入磁盘）
 
-#       :param file_path: 要解密的文件路径（加密状态）
-#       :return: {"success": bool, "data": bytes, "error": str, "size": int}
-#     """
+      :param file_path: 要解密的文件路径（加密状态）
+      :return: {"success": bool, "data": bytes, "error": str, "size": int}
+    """
 
-#     result = await _decrypt_file_internal(file_path)
+    result = await _decrypt_file_internal(file_path)
 
-#     if result["success"] and result["data"]:
-#         result["data"] = base64.b64encode(result["data"]).decode("utf-8")
+    if result["success"] and result["data"]:
+        result["data"] = base64.b64encode(result["data"]).decode("utf-8")
 
-#     return result
+    return result
 
 
 # @mcp.tool()
