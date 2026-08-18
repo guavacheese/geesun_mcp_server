@@ -398,6 +398,13 @@ async def download_from_sandbox(
                    如果以 /reports/ 开头则自动转换为物理路径（$REPORT_ROOT/...），
                    否则作为物理路径直接使用。
 
+    ⚠️ 本工具【没有】file_path 参数（那是 upload_to_sandbox /
+    decrypt_and_upload_to_sandbox 的参数）！参数只有 sandbox_id +
+    sandbox_path + host_path 三个。
+    ⚠️ 若目标文件是 write_file 刚写入 /reports/ 的交付物：它已在宿主机上，
+    【不要】调用本工具——直接交付即可。仅当文件在沙箱 /home/user/ 下、
+    由 execute 脚本生成时才需要本工具拉回。
+
     Returns:
         {"success": bool, "host_path": str | None, "size": int, "error": str | None}
     """
