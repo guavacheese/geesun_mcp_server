@@ -734,7 +734,12 @@ async def run_pdf_diff_stage3(
     沙箱内路径。下载回 reports 目录用 download_from_sandbox。
 
     Args:
-        diff_json_path: diff.json 路径（/reports/... 虚拟路径或 MCP server 物理路径）
+        diff_json_path: diff.json 来源，二选一——
+            (a) 宿主路径：/reports/... 虚拟路径 或 MCP server 物理路径
+                （用 write_file 写入 reports 后传这个）；
+            (b) 沙箱内路径：/home/user/... （diff.json 已在沙箱时直接传沙箱路径，
+                如 /home/user/diff.json）。
+            工具会自动识别前缀，两种都接受。
         out_prefix: 报告文件名前缀（如 "技术协议差异对比报告_阴极vs阳极_20260819_1"），
                     仅允许中文/字母/数字/中划线/下划线/点
         sandbox_id: 目标沙箱 ID
@@ -744,32 +749,54 @@ async def run_pdf_diff_stage3(
          "report_md": "/home/user/技术协议差异对比报告_xxx.md",
          "report_html": "/home/user/技术协议差异对比报告_xxx.html"}
     """
-    host = _resolve_host_path(diff_json_path)
-    if not os.path.isfile(host):
-        return _fail("validate", f"diff.json 不存在: {host}")
     if not _is_valid_sandbox_id(sandbox_id):
         return _fail("validate", f"sandbox_id 无效: {sandbox_id}")
     if not _REPORT_NAME_RE.match(out_prefix or ""):
         return _fail("validate", f"out_prefix 含非法字符: {out_prefix!r}")
 
-    # ── diff.json JSON 合法性预校验（黑盒入口守关口）──
-    # diff.json 是唯一由模型手工产出的输入（语义判定步骤），模型手写 JSON
-    # 易出尾随逗号等语法错误（2026-08-19 实测：line 60 `],` trailing comma
-    # → generate_report.py json.load 抛 JSONDecodeError → exit 1，且 Traceback
-    # 被 DIAG 截断，agent 看不到行/列只能盲目排查绕圈）。这里上传前先解析，
-    # 失败返回精确行/列错误，agent 可直接修复后重调。
-    try:
-        with open(host, "r", encoding="utf-8") as _f:
-            json.load(_f)
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        return _fail(
-            "diff_json_validate",
-            f"diff.json JSON 语法错误: {e}。请修复后重试（注意：JSON 不允许尾随逗号，数组/对象最后一项后不能有逗号）。",
-        )
-    except OSError as e:
-        return _fail("validate", f"读取 diff.json 失败: {e}")
+    # ── diff.json 来源识别：沙箱内路径 vs 宿主路径 ──
+    in_sandbox = diff_json_path.startswith("/home/user/") or diff_json_path.startswith("/tmp/")
+    if in_sandbox:
+        if re.search(r"[;&|$`]", diff_json_path):
+            return _fail("validate", f"diff_json_path 含非法字符: {diff_json_path!r}")
+        chk = await _sandbox_read(sandbox_id, diff_json_path)
+        if not chk["success"] or not chk["data"]:
+            return _fail("validate", f"沙箱内 diff.json 不存在或不可读: {diff_json_path}")
+        sandbox_diff_path = diff_json_path
+        # JSON 合法性预校验（读回沙箱内容解析）
+        try:
+            json.loads(bytes(chk["data"]).decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return _fail(
+                "diff_json_validate",
+                f"diff.json JSON 语法错误: {e}。请修复后重试（注意：JSON 不允许尾随逗号，数组/对象最后一项后不能有逗号）。",
+            )
+    else:
+        host = _resolve_host_path(diff_json_path)
+        if not os.path.isfile(host):
+            return _fail(
+                "validate",
+                f"diff.json 不存在: {host}（若 diff.json 已在沙箱，请直接传沙箱路径如 /home/user/diff.json）",
+            )
+        # ── diff.json JSON 合法性预校验（黑盒入口守关口）──
+        # diff.json 是唯一由模型手工产出的输入（语义判定步骤），模型手写 JSON
+        # 易出尾随逗号等语法错误（2026-08-19 实测：line 60 `],` trailing comma
+        # → generate_report.py json.load 抛 JSONDecodeError → exit 1，且 Traceback
+        # 被 DIAG 截断，agent 看不到行/列只能盲目排查绕圈）。这里上传前先解析，
+        # 失败返回精确行/列错误，agent 可直接修复后重调。
+        try:
+            with open(host, "r", encoding="utf-8") as _f:
+                json.load(_f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return _fail(
+                "diff_json_validate",
+                f"diff.json JSON 语法错误: {e}。请修复后重试（注意：JSON 不允许尾随逗号，数组/对象最后一项后不能有逗号）。",
+            )
+        except OSError as e:
+            return _fail("validate", f"读取 diff.json 失败: {e}")
+        sandbox_diff_path = "/home/user/diff.json"
 
-    # 上传 generate_report.py + diff.json 到沙箱
+    # 上传 generate_report.py（diff.json 仅在宿主来源时需要上传）
     scripts_dir = _find_skill_scripts_dir(PDF_DIFF_SKILL_NAME)
     if not scripts_dir:
         return _fail("scripts", f"未找到 skill {PDF_DIFF_SKILL_NAME} 的 scripts 目录")
@@ -777,17 +804,18 @@ async def run_pdf_diff_stage3(
         r = await _sandbox_write(sandbox_id, "/home/user/scripts/generate_report.py", f.read())
     if not r["success"]:
         return _fail("scripts", r["error"])
-    with open(host, "rb") as f:
-        r = await _sandbox_write(sandbox_id, "/home/user/diff.json", f.read())
-    if not r["success"]:
-        return _fail("upload", r["error"])
+    if not in_sandbox:
+        with open(host, "rb") as f:
+            r = await _sandbox_write(sandbox_id, sandbox_diff_path, f.read())
+        if not r["success"]:
+            return _fail("upload", r["error"])
 
     md_name = f"技术协议差异对比报告_{out_prefix}.md"
     html_name = f"技术协议差异对比报告_{out_prefix}.html"
     for fmt, out_name in (("md", md_name), ("html", html_name)):
         r = await _sandbox_run(
             sandbox_id,
-            f"cd /home/user && python scripts/generate_report.py diff.json --format {fmt} --out \"{out_name}\"",
+            f"cd /home/user && python scripts/generate_report.py \"{sandbox_diff_path}\" --format {fmt} --out \"{out_name}\"",
         )
         if not r["success"]:
             return _fail("report", f"generate_report.py {fmt}: {r['stderr'][:300]}")
