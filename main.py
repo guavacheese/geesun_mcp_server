@@ -1,6 +1,7 @@
 import base64
 import os
 import io
+import json
 import re
 import requests
 from fastmcp import FastMCP
@@ -750,6 +751,23 @@ async def run_pdf_diff_stage3(
         return _fail("validate", f"sandbox_id 无效: {sandbox_id}")
     if not _REPORT_NAME_RE.match(out_prefix or ""):
         return _fail("validate", f"out_prefix 含非法字符: {out_prefix!r}")
+
+    # ── diff.json JSON 合法性预校验（黑盒入口守关口）──
+    # diff.json 是唯一由模型手工产出的输入（语义判定步骤），模型手写 JSON
+    # 易出尾随逗号等语法错误（2026-08-19 实测：line 60 `],` trailing comma
+    # → generate_report.py json.load 抛 JSONDecodeError → exit 1，且 Traceback
+    # 被 DIAG 截断，agent 看不到行/列只能盲目排查绕圈）。这里上传前先解析，
+    # 失败返回精确行/列错误，agent 可直接修复后重调。
+    try:
+        with open(host, "r", encoding="utf-8") as _f:
+            json.load(_f)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        return _fail(
+            "diff_json_validate",
+            f"diff.json JSON 语法错误: {e}。请修复后重试（注意：JSON 不允许尾随逗号，数组/对象最后一项后不能有逗号）。",
+        )
+    except OSError as e:
+        return _fail("validate", f"读取 diff.json 失败: {e}")
 
     # 上传 generate_report.py + diff.json 到沙箱
     scripts_dir = _find_skill_scripts_dir(PDF_DIFF_SKILL_NAME)
