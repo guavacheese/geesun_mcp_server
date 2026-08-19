@@ -493,6 +493,299 @@ async def decrypt_file_to_base64(file_path: str) -> dict:
     return result
 
 
+# ════════════════════════════════════════════════════════════════
+# workflow 工具：tech-spec-pdf-diff 确定性执行（Phase 2）
+# 设计：把"模型读 SKILL.md 后自觉照做"改为"结构化上只能走固定流程"。
+#   stage1（解密→提取→结构对齐→差异页定位）与 stage3（报告生成）为确定性
+#   黑盒；diff.json 语义判定（唯一需要 LLM 判断的步骤）保留给 agent。
+#   2026-08-19 落地；依据 Anthropic workflows-vs-agents 二分。
+# ════════════════════════════════════════════════════════════════
+
+PDF_DIFF_SKILL_NAME = "tech-spec-pdf-diff"
+PDF_DIFF_SCRIPTS = (
+    "extract_pdf.py",
+    "diff_structures.py",
+    "diff_pages.py",
+    "generate_report.py",
+)
+_REPORT_NAME_RE = re.compile(r"^[\w\u4e00-\u9fa5\-_\.]+$")
+
+
+def _resolve_host_path(path: str) -> str:
+    """虚拟路径（/uploads/、/reports/）→ MCP server 物理路径；否则原样返回。"""
+    if path.startswith("/uploads/"):
+        root = os.environ.get("UPLOAD_ROOT", "")
+        if root:
+            return f"{root}/{path[len('/uploads/'):]}"
+    if path.startswith("/reports/"):
+        root = os.environ.get("REPORT_ROOT", "")
+        if root:
+            return f"{root}/{path[len('/reports/'):]}"
+    return path
+
+
+def _find_skill_scripts_dir(skill_name: str) -> str | None:
+    """全局搜索 skill 的 scripts 目录（__system__ → __agent__ → 所有 __user_*__）。"""
+    agent_workspace = os.environ.get("AGENT_WORKSPACE", "")
+    if not agent_workspace:
+        return None
+    skills_base = f"{agent_workspace}/skills"
+    if not os.path.isdir(skills_base):
+        return None
+    source_dirs = ["__system__", "__agent__"]
+    for entry in sorted(os.listdir(skills_base)):
+        if entry.startswith("__user_") and os.path.isdir(f"{skills_base}/{entry}"):
+            source_dirs.append(entry)
+    for source in source_dirs:
+        scripts_dir = f"{skills_base}/{source}/{skill_name}/scripts"
+        if os.path.isdir(scripts_dir):
+            return scripts_dir
+    return None
+
+
+def _e2b_env() -> None:
+    """E2B API 连接配置（与现有工具一致）。"""
+    os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
+    os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY", ""))
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
+    if ssl_cert:
+        os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
+
+
+def _dlp_encrypted(file_path: str) -> bool:
+    """按文件头判断是否 DLP 加密（不看扩展名，txt/py 也可能被加密）。"""
+    try:
+        with open(file_path, "rb") as f:
+            head = f.read(16)
+        return any(head.startswith(sig) for sig in DLP_HEADER_SIGNATURES)
+    except Exception:
+        return False
+
+
+async def _sandbox_write(sandbox_id: str, path: str, content: bytes) -> dict:
+    """写文件到沙箱。"""
+    _e2b_env()
+    try:
+        sb = E2BSandbox.connect(sandbox_id)
+        sb.files.write(path, content)
+        return {"success": True, "error": None}
+    except Exception as e:
+        return {"success": False, "error": f"写沙箱文件失败: {str(e)}"}
+
+
+async def _sandbox_run(sandbox_id: str, cmd: str, timeout: int = 300) -> dict:
+    """沙箱内执行命令（commands.run 返回结构 getattr 容错，兼容不同 SDK 版本）。"""
+    _e2b_env()
+    try:
+        sb = E2BSandbox.connect(sandbox_id)
+        res = sb.commands.run(cmd, timeout=timeout)
+        exit_code = getattr(res, "exit_code", None)
+        stdout = getattr(res, "stdout", None)
+        stderr = getattr(res, "stderr", None)
+        if exit_code is None:
+            # 部分 SDK 版本无 exit_code，用 error 字段
+            error = getattr(res, "error", None)
+            success = not error
+        else:
+            success = exit_code == 0
+        return {
+            "success": success,
+            "stdout": str(stdout or ""),
+            "stderr": str(stderr or ""),
+        }
+    except Exception as e:
+        return {"success": False, "stdout": "", "stderr": str(e)}
+
+
+async def _sandbox_read(sandbox_id: str, path: str) -> dict:
+    """读沙箱文件（bytes）。"""
+    _e2b_env()
+    try:
+        sb = E2BSandbox.connect(sandbox_id)
+        content = sb.files.read(path, format="bytes")
+        return {"success": True, "data": content, "error": None}
+    except Exception as e:
+        return {"success": False, "data": None, "error": f"读沙箱文件失败: {str(e)}"}
+
+
+def _fail(step: str, error: str) -> dict:
+    return {"success": False, "step": step, "error": error}
+
+
+@mcp.tool()
+async def run_pdf_diff_stage1(
+    doc_a_path: str,
+    doc_b_path: str,
+    sandbox_id: str,
+) -> dict:
+    """
+    技术协议 PDF 差异比对 - 阶段1（确定性流程，禁止自行编写替代代码）。
+
+    内部固定执行：DLP 解密（如需要）→ 上传 skill 脚本 → extract_pdf.py 提取
+    两份文档 → diff_structures.py 结构粗筛 → diff_pages.py 机械定位差异页。
+    每步产物确定性校验，失败返回具体 step 与错误。
+
+    Args:
+        doc_a_path: 文档 A PDF 路径（/uploads/... 虚拟路径或 MCP server 物理路径）
+        doc_b_path: 文档 B PDF 路径
+        sandbox_id: 目标沙箱 ID
+
+    Returns:
+        {"success": bool, "step": str|None, "error": str|None,
+         "doc_a_json": "/home/user/docA.json", "doc_b_json": "/home/user/docB.json",
+         "diff_pages_json": "/home/user/diff_pages.json",
+         "diff_summary": str, "structure_summary": str}
+        后续请基于 diff_pages 候选差异页 + extract 全文做语义判定，整理 diff.json。
+    """
+    a = _resolve_host_path(doc_a_path)
+    b = _resolve_host_path(doc_b_path)
+    for p in (a, b):
+        if not os.path.isfile(p):
+            return _fail("validate", f"PDF 文件不存在: {p}")
+    if not _is_valid_sandbox_id(sandbox_id):
+        return _fail("validate", f"sandbox_id 无效: {sandbox_id}")
+
+    # ① 上传 skill 脚本
+    scripts_dir = _find_skill_scripts_dir(PDF_DIFF_SKILL_NAME)
+    if not scripts_dir:
+        return _fail("scripts", f"未找到 skill {PDF_DIFF_SKILL_NAME} 的 scripts 目录（AGENT_WORKSPACE 未设置？）")
+    for name in PDF_DIFF_SCRIPTS:
+        src = f"{scripts_dir}/{name}"
+        if not os.path.isfile(src):
+            return _fail("scripts", f"脚本缺失: {name}")
+        with open(src, "rb") as f:
+            content = f.read()
+        r = await _sandbox_write(sandbox_id, f"/home/user/scripts/{name}", content)
+        if not r["success"]:
+            return _fail("scripts", r["error"])
+
+    # ② 准备 PDF（DLP 加密 → 解密写明文；否则直接上传）
+    for src, dst in ((a, "docA.pdf"), (b, "docB.pdf")):
+        if _dlp_encrypted(src):
+            dec = await _decrypt_file_internal(src)
+            if not dec["success"]:
+                return _fail("decrypt", f"{src}: {dec['error']}")
+            content = dec["data"]
+        else:
+            with open(src, "rb") as f:
+                content = f.read()
+        r = await _sandbox_write(sandbox_id, f"/home/user/{dst}", content)
+        if not r["success"]:
+            return _fail("upload", r["error"])
+
+    # ③ 提取（pdfplumber 依赖保障：先检查，缺则装）
+    r = await _sandbox_run(sandbox_id, 'cd /home/user && python -c "import pdfplumber"')
+    if not r["success"]:
+        r2 = await _sandbox_run(sandbox_id, "cd /home/user && pip install -q pdfplumber")
+        if not r2["success"]:
+            return _fail("extract", f"pdfplumber 安装失败: {r2['stderr'][:300]}")
+    for dst in ("docA", "docB"):
+        r = await _sandbox_run(
+            sandbox_id,
+            f"cd /home/user && python scripts/extract_pdf.py {dst}.pdf --chapters --out {dst}.json",
+        )
+        if not r["success"]:
+            return _fail("extract", f"extract_pdf.py {dst}: {r['stderr'][:300]}")
+        chk = await _sandbox_read(sandbox_id, f"/home/user/{dst}.json")
+        if not chk["success"] or not chk["data"]:
+            return _fail("extract", f"{dst}.json 未生成")
+
+    # ④ 结构粗筛（stdout 作为摘要，不阻塞后续）
+    r = await _sandbox_run(
+        sandbox_id,
+        "cd /home/user && python scripts/diff_structures.py docA.json docB.json --print",
+    )
+    struct_summary = r["stdout"] if r["success"] else f"(结构对齐失败: {r['stderr'][:200]})"
+
+    # ⑤ 差异页定位
+    r = await _sandbox_run(
+        sandbox_id,
+        "cd /home/user && python scripts/diff_pages.py docA.json docB.json --print --out diff_pages.json",
+    )
+    if not r["success"]:
+        return _fail("diff_pages", r["stderr"][:300])
+    chk = await _sandbox_read(sandbox_id, "/home/user/diff_pages.json")
+    if not chk["success"] or not chk["data"]:
+        return _fail("diff_pages", "diff_pages.json 未生成")
+
+    return {
+        "success": True,
+        "step": None,
+        "error": None,
+        "doc_a_json": "/home/user/docA.json",
+        "doc_b_json": "/home/user/docB.json",
+        "diff_pages_json": "/home/user/diff_pages.json",
+        "diff_summary": (r["stdout"] or "")[:2000] or "（无输出）",
+        "structure_summary": struct_summary[:1000],
+    }
+
+
+@mcp.tool()
+async def run_pdf_diff_stage3(
+    diff_json_path: str,
+    out_prefix: str,
+    sandbox_id: str,
+) -> dict:
+    """
+    技术协议 PDF 差异比对 - 阶段3（确定性流程，禁止自行编写替代代码）。
+
+    基于你整理好的 diff.json 生成 Markdown/HTML 差异报告到沙箱，并返回
+    沙箱内路径。下载回 reports 目录用 download_from_sandbox。
+
+    Args:
+        diff_json_path: diff.json 路径（/reports/... 虚拟路径或 MCP server 物理路径）
+        out_prefix: 报告文件名前缀（如 "技术协议差异对比报告_阴极vs阳极_20260819_1"），
+                    仅允许中文/字母/数字/中划线/下划线/点
+        sandbox_id: 目标沙箱 ID
+
+    Returns:
+        {"success": bool, "step": str|None, "error": str|None,
+         "report_md": "/home/user/技术协议差异对比报告_xxx.md",
+         "report_html": "/home/user/技术协议差异对比报告_xxx.html"}
+    """
+    host = _resolve_host_path(diff_json_path)
+    if not os.path.isfile(host):
+        return _fail("validate", f"diff.json 不存在: {host}")
+    if not _is_valid_sandbox_id(sandbox_id):
+        return _fail("validate", f"sandbox_id 无效: {sandbox_id}")
+    if not _REPORT_NAME_RE.match(out_prefix or ""):
+        return _fail("validate", f"out_prefix 含非法字符: {out_prefix!r}")
+
+    # 上传 generate_report.py + diff.json 到沙箱
+    scripts_dir = _find_skill_scripts_dir(PDF_DIFF_SKILL_NAME)
+    if not scripts_dir:
+        return _fail("scripts", f"未找到 skill {PDF_DIFF_SKILL_NAME} 的 scripts 目录")
+    with open(f"{scripts_dir}/generate_report.py", "rb") as f:
+        r = await _sandbox_write(sandbox_id, "/home/user/scripts/generate_report.py", f.read())
+    if not r["success"]:
+        return _fail("scripts", r["error"])
+    with open(host, "rb") as f:
+        r = await _sandbox_write(sandbox_id, "/home/user/diff.json", f.read())
+    if not r["success"]:
+        return _fail("upload", r["error"])
+
+    md_name = f"技术协议差异对比报告_{out_prefix}.md"
+    html_name = f"技术协议差异对比报告_{out_prefix}.html"
+    for fmt, out_name in (("md", md_name), ("html", html_name)):
+        r = await _sandbox_run(
+            sandbox_id,
+            f"cd /home/user && python scripts/generate_report.py diff.json --format {fmt} --out \"{out_name}\"",
+        )
+        if not r["success"]:
+            return _fail("report", f"generate_report.py {fmt}: {r['stderr'][:300]}")
+        chk = await _sandbox_read(sandbox_id, f"/home/user/{out_name}")
+        if not chk["success"] or not chk["data"] or len(chk["data"]) < 100:
+            return _fail("report", f"{out_name} 未生成或过小")
+
+    return {
+        "success": True,
+        "step": None,
+        "error": None,
+        "report_md": f"/home/user/{md_name}",
+        "report_html": f"/home/user/{html_name}",
+    }
+
+
 # @mcp.tool()
 # async def read_excel(file_path: str, sheet_name: Optional[str] = None) -> dict:
 #     """
