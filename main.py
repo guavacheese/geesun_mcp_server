@@ -148,19 +148,17 @@ async def upload_to_sandbox(
     文件从宿主机直传沙箱，不经过 LLM 上下文。
 
     Args:
-        file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}）
+        file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}、
+                   /reports/{user_id}/{session_id}/{filename}）或 MCP server
+                   物理路径；自动转换
         remote_path: 沙箱内的目标路径（如 /home/user/data.xml）
         sandbox_id: 目标沙箱 ID
 
     Returns:
         {"success": bool, "sandbox_path": str | None, "size": int, "error": str | None}
     """
-    # 路径转换：虚拟路径 → 物理路径
-    if file_path.startswith("/uploads/"):
-        upload_root = os.environ.get("UPLOAD_ROOT", "")
-        if upload_root:
-            relative_path = file_path[len("/uploads/") :]
-            file_path = f"{upload_root}/{relative_path}"
+    # 路径转换：/uploads/、/reports/ 虚拟路径 → 物理路径（复用 _resolve_host_path）
+    file_path = _resolve_host_path(file_path)
 
     try:
         with open(file_path, "rb") as f:
