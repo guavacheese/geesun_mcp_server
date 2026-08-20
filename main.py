@@ -505,9 +505,12 @@ PDF_DIFF_SCRIPTS = (
     "extract_pdf.py",
     "diff_structures.py",
     "diff_pages.py",
+    "align_blocks.py",
     "generate_report.py",
 )
 _REPORT_NAME_RE = re.compile(r"^[\w\u4e00-\u9fa5\-_\.]+$")
+# 扫描件/图片型 PDF 判定：平均每页字符数低于此阈值视为无文本层（需 OCR，无法文本比对）
+SCAN_MIN_AVG_CHARS = 50
 
 
 def _resolve_host_path(path: str) -> str:
@@ -611,6 +614,31 @@ def _fail(step: str, error: str) -> dict:
     return {"success": False, "step": step, "error": error}
 
 
+async def _trace_check(sandbox_id: str, diff_json_data: dict) -> list[str]:
+    """
+    宽松追溯校验（④）：基于沙箱 diff_pages.json 的 alignment，验证 diff.json 引用的章节号
+    有机械证据（存在于对齐结果的章节集合）。凭空引用的章节号 → warning（不阻断，因 diff.json 为自由文本）。
+    """
+    r = await _sandbox_read(sandbox_id, "/home/user/diff_pages.json")
+    if not r["success"] or not r["data"]:
+        return ["[trace] 沙箱内无 diff_pages.json（未跑 stage1？），跳过追溯校验"]
+    try:
+        dp = json.loads(bytes(r["data"]).decode("utf-8"))
+    except Exception as e:
+        return [f"[trace] diff_pages.json 解析失败: {e}"]
+    alignment = dp.get("alignment")
+    if not alignment:
+        return ["[trace] diff_pages.json 无 alignment 数据（非 aligned 产物），跳过追溯校验"]
+    agg_nums = {x.get("chapter") for x in alignment.get("chapter_agg", []) if x.get("chapter")}
+    text = json.dumps(diff_json_data, ensure_ascii=False)
+    ref_nums = set(re.findall(r"([一二三四五六七八九十]+)、", text))
+    missing = ref_nums - agg_nums
+    if not missing:
+        return []
+    return [f"[trace] diff.json 引用了对齐结果中不存在的章节号 {sorted(missing)}（疑似凭空生成，请核对；"
+            f"对齐章节号: {sorted(agg_nums)}）"]
+
+
 @mcp.tool()
 async def run_pdf_diff_stage1(
     doc_a_path: str,
@@ -688,18 +716,29 @@ async def run_pdf_diff_stage1(
         chk = await _sandbox_read(sandbox_id, f"/home/user/{dst}.json")
         if not chk["success"] or not chk["data"]:
             return _fail("extract", f"{dst}.json 未生成")
+        # 扫描件/图片型 PDF 检测：无文本层（平均每页字符数过低）时明确报错，不静默出空报告
+        try:
+            doc = json.loads(bytes(chk["data"]).decode("utf-8"))
+            avg = doc.get("avg_chars_per_page", 0)
+            if avg < SCAN_MIN_AVG_CHARS:
+                return _fail(
+                    "extract",
+                    f"{dst}.pdf 疑似扫描件/图片型 PDF（平均每页仅 {avg} 字符，无文本层），无法做文本差异比对，需先 OCR。",
+                )
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return _fail("extract", f"{dst}.json 解析失败: {e}")
 
-    # ④ 结构粗筛（stdout 作为摘要，不阻塞后续）
+    # ④ 结构粗筛（stdout 作为摘要，不阻塞后续；--aligned 内容感知对齐，消除页码偏移 cascade）
     r = await _sandbox_run(
         sandbox_id,
-        "cd /home/user && python scripts/diff_structures.py docA.json docB.json --print",
+        "cd /home/user && python scripts/diff_structures.py docA.json docB.json --aligned --print",
     )
     struct_summary = r["stdout"] if r["success"] else f"(结构对齐失败: {r['stderr'][:200]})"
 
-    # ⑤ 差异页定位
+    # ⑤ 差异页定位（--aligned：条款级 LCS 反推差异页，diff_pages.json 内含 alignment 供 stage3 追溯校验）
     r = await _sandbox_run(
         sandbox_id,
-        "cd /home/user && python scripts/diff_pages.py docA.json docB.json --print --out diff_pages.json",
+        "cd /home/user && python scripts/diff_pages.py docA.json docB.json --aligned --print --out diff_pages.json",
     )
     if not r["success"]:
         return _fail("diff_pages", r["stderr"][:300])
@@ -754,6 +793,7 @@ async def run_pdf_diff_stage3(
 
     # ── diff.json 来源识别：沙箱内路径 vs 宿主路径 ──
     in_sandbox = diff_json_path.startswith("/home/user/") or diff_json_path.startswith("/tmp/")
+    diff_data = None
     if in_sandbox:
         if re.search(r"[;&|$`]", diff_json_path):
             return _fail("validate", f"diff_json_path 含非法字符: {diff_json_path!r}")
@@ -763,7 +803,7 @@ async def run_pdf_diff_stage3(
         sandbox_diff_path = diff_json_path
         # JSON 合法性预校验（读回沙箱内容解析）
         try:
-            json.loads(bytes(chk["data"]).decode("utf-8"))
+            diff_data = json.loads(bytes(chk["data"]).decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             return _fail(
                 "diff_json_validate",
@@ -784,7 +824,7 @@ async def run_pdf_diff_stage3(
         # 失败返回精确行/列错误，agent 可直接修复后重调。
         try:
             with open(host, "r", encoding="utf-8") as _f:
-                json.load(_f)
+                diff_data = json.load(_f)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             return _fail(
                 "diff_json_validate",
@@ -793,6 +833,9 @@ async def run_pdf_diff_stage3(
         except OSError as e:
             return _fail("validate", f"读取 diff.json 失败: {e}")
         sandbox_diff_path = "/home/user/diff.json"
+
+    # ── ④ 追溯校验（宽松）：diff.json 引用的章节号需有 alignment 证据，凭空引用告警 ──
+    trace_warnings = await _trace_check(sandbox_id, diff_data)
 
     # 上传 generate_report.py（diff.json 仅在宿主来源时需要上传）
     scripts_dir = _find_skill_scripts_dir(PDF_DIFF_SKILL_NAME)
@@ -827,6 +870,7 @@ async def run_pdf_diff_stage3(
         "error": None,
         "report_md": f"/home/user/{md_name}",
         "report_html": f"/home/user/{html_name}",
+        "trace_warnings": trace_warnings,
     }
 
 
