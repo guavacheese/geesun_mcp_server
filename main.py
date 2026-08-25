@@ -219,11 +219,11 @@ async def decrypt_and_upload_to_sandbox(
     sandbox_id: str,
 ) -> dict:
     """
-    【唯一方式】读取被公司加密的文件：解密并直接上传到 CubeSandbox 沙箱内。
+    读取被公司加密的文件：解密并直接上传到 CubeSandbox 沙箱内（与 upload_to_sandbox 等价，后者已内置 DLP 兜底自动解密）。
 
     公司 DLP 会加密 PDF / Excel / Word，以及 txt、py 等任意文本类文件
     （判断是否加密看文件头 %TSD-Header，不看扩展名）。
-    本工具是读取加密文件的唯一正确入口；upload_to_sandbox 会拒绝密文。
+    本工具与 upload_to_sandbox 等价：upload_to_sandbox 现也已内置 DLP 兜底（检测到 %TSD-Header 自动解密上传），两者均可解密上传，明文不落盘。
 
     解密后的明文会写入沙箱文件系统，不经过 LLM 上下文，不落地宿主机磁盘。
 
@@ -235,15 +235,9 @@ async def decrypt_and_upload_to_sandbox(
     Returns:
         {"success": bool, "sandbox_path": str | None, "size": int, "error": str | None}
     """
-    # 路径转换：虚拟路径 → 物理路径
-    if file_path.startswith("/uploads/"):
-        # /uploads/{user_id}/{session_id}/{filename}
-        # → /mnt/d/workspace/geesun_agent/data/uploads/{user_id}/{session_id}/{filename}
-        upload_root = os.environ.get("UPLOAD_ROOT", "")
-        if upload_root:
-            # 去掉 /uploads/ 前缀，拼接物理路径
-            relative_path = file_path[len("/uploads/") :]
-            file_path = f"{upload_root}/{relative_path}"
+    # 路径转换：虚拟路径 → 物理路径（复用 _resolve_host_path，与 upload_to_sandbox 一致，
+    # 同时支持 /uploads/ 与 /reports/，消除原实现只认 /uploads/ 的盲区）
+    file_path = _resolve_host_path(file_path)
 
     # 1. 解密到内存
     result = await _decrypt_file_internal(file_path)
