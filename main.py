@@ -8,9 +8,12 @@ from fastmcp import FastMCP
 from dotenv import load_dotenv
 from typing import Optional
 import httpx
+import logging
 from e2b_code_interpreter import Sandbox as E2BSandbox
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 decrypt_api_url = os.getenv("DECRYPT_API_URL")
 mcp = FastMCP("decrypt-file")
@@ -171,20 +174,18 @@ async def upload_to_sandbox(
             "error": f"读取文件失败: {str(e)}",
         }
 
-    # ── v3.1 护栏：DLP 加密文件（%TSD-Header 文件头）不得从明文通道上传 ──
-    # upload_to_sandbox 不解密，密文进沙箱后 AI 无法解析，纯浪费步数。
-    # 判断靠文件头（不靠扩展名）：txt/py 等文本类文件也可能被公司 DLP 加密。
+    # ── v3.1 护栏升级：检测到 DLP 加密 → 自动切换为解密上传 ──
+    # 不再返回错误让 LLM 自行换工具：实测长上下文下模型会忽略该提示、反复
+    # 调 upload_to_sandbox 失败（server.log 已实锤 tool_calls 连续两次 upload_to_sandbox 均 FAIL）。
+    # 兜底复用 decrypt_and_upload_to_sandbox 的合规解密链路（内存解密→直传沙箱，明文不落盘），
+    # 安全姿态不变，仅移除对「调用方正确选工具」的依赖。解密失败如实透传，不假装成功。
     if any(content.startswith(sig) for sig in DLP_HEADER_SIGNATURES):
-        return {
-            "success": False,
-            "sandbox_path": None,
-            "size": 0,
-            "error": (
-                f"检测到 '{file_path}' 是公司 DLP 加密文件（文件头 {DLP_HEADER_SIGNATURES[0].decode(errors='replace')}），"
-                "upload_to_sandbox 不解密，密文进沙箱后无法解析。"
-                "请改用 decrypt_and_upload_to_sandbox 解密后上传到沙箱。"
-            ),
-        }
+        logger.warning(
+            "[DLP] 检测到加密文件 %s，upload_to_sandbox 自动切换为解密上传"
+            "（等价于 decrypt_and_upload_to_sandbox）",
+            file_path,
+        )
+        return await decrypt_and_upload_to_sandbox(file_path, remote_path, sandbox_id)
 
     # E2B API 连接配置
     os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
