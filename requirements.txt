@@ -1,0 +1,10 @@
+# 依赖与 pyproject.toml / uv.lock 严格对齐（生产镜像可复现，避免 dev/prod 漂移）
+# 解析版本取自本仓库 uv.lock（Python 3.13）。
+fastmcp==3.2.4
+e2b-code-interpreter==2.8.1
+httpx==0.28.1
+requests==2.33.1
+python-dotenv==1.2.2
+openpyxl==3.1.5
+pandas==3.0.2
+pypdf2==3.0.1

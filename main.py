@@ -1040,7 +1040,7 @@ async def run_pdf_diff_stage3(
 
 if __name__ == "__main__":
     print("启动 企业文件解密 MCP 服务 (Python)")
-    print("服务地址: http://127.0.0.1:8000/mcp")
+    print("服务地址: http://0.0.0.0:8000/mcp")
     print("\n可用工具:")
     print("  - decrypt_file: 解密文件返回字节流")
     print("  - read_excel: 解密并读取 Excel")
@@ -1049,8 +1049,10 @@ if __name__ == "__main__":
     print("  - list_excel_sheets: 列出 Excel 所有工作表")
     print("\n按 Ctrl+C 停止服务")
 
+    # host=0.0.0.0：容器化部署时 agent 经 appnet 服务名 geesun-mcp 访问；
+    # 若仍按 dev 同机裸跑，0.0.0.0 同样接受 127.0.0.1 的本地连接，行为不变。
     mcp.run(
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=8000,
         transport="streamable-http",
     )
