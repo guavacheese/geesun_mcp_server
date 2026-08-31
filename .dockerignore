@@ -1,0 +1,25 @@
+# geesun_mcp_server 构建上下文排除清单
+# 根因：Windows 下 .venv/lib64 是指向 lib 的符号链接，Docker 遍历构建上下文无权限跟随，
+#       报 `error from sender: open ...\.venv\lib64: Access is denied`（2026-08-31 实测）。
+#       且 Dockerfile 为 `COPY . /app`（整目录拷贝），不排除会把 .venv(184MB) 与 .env(密钥) 一起烘焙进镜像。
+
+# 虚拟环境（镜像内依赖由 requirements.txt + pip 安装，宿主 .venv 本就不该进镜像）
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# 环境变量（含 E2B_API_KEY / DECRYPT_API_URL 等密钥，绝不进镜像）
+.env
+.env.*
+!.env.example
+
+# Git / 编辑器 / 杂项
+.git/
+.gitignore
+.idea/
+.commit_msg
+.DS_Store
+
+# 日志
+*.log
