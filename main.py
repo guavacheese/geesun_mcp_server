@@ -124,8 +124,10 @@ async def copy_script_to_sandbox(
     if ssl_cert:
         os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
 
-    sb = E2BSandbox.connect(sandbox_id)
+    # connect 必须在 try 内：E2B 控制面不可达/沙箱已销毁时 connect 抛异常
+    # （e2b 解析 404 响应可能 KeyError: 'code'），不能让它冒泡成工具级 ToolException
     try:
+        sb = E2BSandbox.connect(sandbox_id)
         sb.files.write(sandbox_path, content)
     except Exception as e:
         return {
@@ -194,8 +196,10 @@ async def upload_to_sandbox(
     if ssl_cert:
         os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
 
-    sb = E2BSandbox.connect(sandbox_id)
+    # connect 必须在 try 内：E2B 控制面不可达/沙箱已销毁时 connect 抛异常
+    # （e2b 解析 404 响应可能 KeyError: 'code'），不能让它冒泡成工具级 ToolException
     try:
+        sb = E2BSandbox.connect(sandbox_id)
         sb.files.write(remote_path, content)
         return {
             "success": True,
@@ -208,7 +212,7 @@ async def upload_to_sandbox(
             "success": False,
             "sandbox_path": None,
             "size": 0,
-            "error": str(e),
+            "error": f"连接/写入沙箱 {sandbox_id} 失败: {e}",
         }
 
 
@@ -256,8 +260,10 @@ async def decrypt_and_upload_to_sandbox(
     if ssl_cert:
         os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
 
-    sb = E2BSandbox.connect(sandbox_id)
+    # connect 必须在 try 内：E2B 控制面不可达/沙箱已销毁时 connect 抛异常
+    # （e2b 解析 404 响应可能 KeyError: 'code'），不能让它冒泡成工具级 ToolException
     try:
+        sb = E2BSandbox.connect(sandbox_id)
         sb.files.write(remote_path, result["data"])
         return {
             "success": True,
@@ -270,7 +276,7 @@ async def decrypt_and_upload_to_sandbox(
             "success": False,
             "sandbox_path": None,
             "size": 0,
-            "error": str(e),
+            "error": f"连接/写入沙箱 {sandbox_id} 失败: {e}",
         }
     # ☝️ 注意：不调 sb.kill()，沙箱由 Agent 管理
     #    connect 创建的对象会在函数返回后被 Python GC 回收
@@ -437,8 +443,10 @@ async def download_from_sandbox(
     if ssl_cert:
         os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
 
-    sb = E2BSandbox.connect(sandbox_id)
+    # connect 必须在 try 内：E2B 控制面不可达/沙箱已销毁时 connect 抛异常
+    # （e2b 解析 404 响应可能 KeyError: 'code'），不能让它冒泡成工具级 ToolException
     try:
+        sb = E2BSandbox.connect(sandbox_id)
         content = sb.files.read(sandbox_path, format="bytes")
     except Exception as e:
         return {
