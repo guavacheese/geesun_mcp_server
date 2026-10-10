@@ -22,6 +22,23 @@ mcp = FastMCP("decrypt-file")
 # 判断"文件是否加密"不靠扩展名（txt/py 也可能被加密），靠文件头特征。
 DLP_HEADER_SIGNATURES: tuple[bytes, ...] = (b"%TSD-Header",)
 
+# ── 上传护栏（Stage 1，2026-10-10）──────────────────────────────────
+# 背景（2026-10-09 事故 会话 cecfdd84）：256.4MiB 的 DLP 加密 PDF 走 upload_to_sandbox，
+# 原实现先 `f.read()` 全量读 256.4MiB 判头，命中后再转 decrypt_and_upload_to_sandbox，
+# 而后者又 read 一遍、此时调用方的 content 引用尚未释放 → 峰值 2N ≈ 512.8MiB 常驻，
+# 越过当时 512MiB 的容器限额 → cgroup OOM-kill（内核 memcg 记录 10-08 6 次 / 10-09 6 次，
+# swarm task 连续 exit 137）。MCP 单副本共享，一炸会把全体用户的 in-flight 工具调用一起打断，
+# agent 侧表现为工具永不返回、被 LangGraph 记成 "was cancelled - another message came in"，
+# 模型进而误诊为"虚拟文件系统元数据不一致"，引导用户重传（方向全错）。
+# 修复分两阶段：
+#   Stage 1（本项）：① 先探 16B 判头，消掉一次全量读（省 1N）；
+#                    ② getsize 预检 + 结构化中文错误，让失败可读、不再以"炸掉共享容器"的方式失败；
+#                    ③ 解密超时可配（原 30s 对 256MiB 级文件明显不够，会被超时误伤）。
+#   Stage 2（待 spike 证实后）：全程流式（解密请求/响应 + 沙箱写入都不再全量驻留），
+#                    并把阻塞的 E2B 同步调用挪出事件循环线程。
+MAX_UPLOAD_MB = int(os.getenv("MCP_MAX_UPLOAD_MB", "2048"))
+DECRYPT_TIMEOUT_S = int(os.getenv("DECRYPT_TIMEOUT_S", "600"))
+
 
 @mcp.tool()
 async def copy_script_to_sandbox(
@@ -147,10 +164,13 @@ async def upload_to_sandbox(
     sandbox_id: str,
 ) -> dict:
     """
-    上传宿主机的文件到沙箱（不解密），不经过 LLM 上下文。
+    上传宿主机的文件到沙箱（自动处理 DLP 加密），不经过 LLM 上下文。
 
-    适用于 XML、TXT 等不需要解密的文件。
-    文件从宿主机直传沙箱，不经过 LLM 上下文。
+    适用于 XML、TXT 等不需要解密的文件；若文件被 DLP 加密（文件头 %TSD-Header），
+    会**自动**转解密链路，调用方无需自己判断、也无需换工具。
+
+    大小上限由环境变量 MCP_MAX_UPLOAD_MB 控制（当前见返回体 max_upload_mb）；
+    超限不会静默截断，会返回 error_code=file_too_large 的结构化中文错误。
 
     Args:
         file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}、
@@ -160,10 +180,44 @@ async def upload_to_sandbox(
         sandbox_id: 目标沙箱 ID
 
     Returns:
-        {"success": bool, "sandbox_path": str | None, "size": int, "error": str | None}
+        {"success": bool, "error_code": str | None, "sandbox_path": str | None,
+         "size": int, "error": str | None}
+        失败时另带 virtual_path / physical_path / size_human / max_upload_mb / hint，
+        error_code ∈ {file_not_found, file_too_large, read_failed,
+                      decrypt_failed, decrypt_timeout, decrypt_api_error,
+                      sandbox_write_failed}
     """
     # 路径转换：/uploads/、/reports/ 虚拟路径 → 物理路径（复用 _resolve_host_path）
+    # original_path 保留调用方原样传入的（通常是 /uploads/... 虚拟路径），
+    # 用于结构化错误体里同时给出【虚拟路径】与【物理路径】——治"只报虚拟路径、
+    # 让人看不出映射缺失"的老毛病（2026-10-09 模型正是据此误诊为虚拟 FS 元数据不一致）。
+    original_path = file_path
     file_path = _resolve_host_path(file_path)
+
+    # ── Stage 1 预检：路径存在性 + 文件大小上限 ──
+    # 失败直接返回结构化中文错误：不抛异常、不进入读文件路径。
+    # 超限文件在预检就被挡下，不再以"把共享容器内存撑爆"的方式失败。
+    bad = _upload_precheck(file_path, original_path)
+    if bad:
+        return bad
+
+    # ── v3.1 护栏升级：检测到 DLP 加密 → 自动切换为解密上传 ──
+    # 不再返回错误让 LLM 自行换工具：实测长上下文下模型会忽略该提示、反复
+    # 调 upload_to_sandbox 失败（server.log 已实锤 tool_calls 连续两次 upload_to_sandbox 均 FAIL）。
+    # 兜底复用 decrypt_and_upload_to_sandbox 的合规解密链路（内存解密→直传沙箱，明文不落盘），
+    # 安全姿态不变，仅移除对「调用方正确选工具」的依赖。解密失败如实透传，不假装成功。
+    # ── Stage 1 改动：判头改为"只读 16 字节"（_dlp_encrypted）──
+    # 原实现是"先 f.read() 全量读 N 字节判头 → 命中后再转 decrypt_and_upload_to_sandbox
+    # 让它 read 一遍"，此时调用方的 content 引用尚未释放 → 峰值 2N 常驻
+    # （256.4MiB 文件即 512.8MiB），正是 2026-10-09 OOM-kill 的直接原因。现改为先探头。
+    if _dlp_encrypted(file_path):
+        logger.warning(
+            "[DLP] 检测到加密文件 %s（%s），upload_to_sandbox 自动切换为解密上传"
+            "（等价于 decrypt_and_upload_to_sandbox，明文不落盘）",
+            file_path,
+            _human_size(os.path.getsize(file_path)),
+        )
+        return await decrypt_and_upload_to_sandbox(file_path, remote_path, sandbox_id)
 
     try:
         with open(file_path, "rb") as f:
@@ -171,23 +225,13 @@ async def upload_to_sandbox(
     except Exception as e:
         return {
             "success": False,
+            "error_code": "read_failed",
+            "error": f"读取文件失败: {e}",
+            "virtual_path": original_path,
+            "physical_path": file_path,
             "sandbox_path": None,
             "size": 0,
-            "error": f"读取文件失败: {str(e)}",
         }
-
-    # ── v3.1 护栏升级：检测到 DLP 加密 → 自动切换为解密上传 ──
-    # 不再返回错误让 LLM 自行换工具：实测长上下文下模型会忽略该提示、反复
-    # 调 upload_to_sandbox 失败（server.log 已实锤 tool_calls 连续两次 upload_to_sandbox 均 FAIL）。
-    # 兜底复用 decrypt_and_upload_to_sandbox 的合规解密链路（内存解密→直传沙箱，明文不落盘），
-    # 安全姿态不变，仅移除对「调用方正确选工具」的依赖。解密失败如实透传，不假装成功。
-    if any(content.startswith(sig) for sig in DLP_HEADER_SIGNATURES):
-        logger.warning(
-            "[DLP] 检测到加密文件 %s，upload_to_sandbox 自动切换为解密上传"
-            "（等价于 decrypt_and_upload_to_sandbox）",
-            file_path,
-        )
-        return await decrypt_and_upload_to_sandbox(file_path, remote_path, sandbox_id)
 
     # E2B API 连接配置
     os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
@@ -203,6 +247,7 @@ async def upload_to_sandbox(
         sb.files.write(remote_path, content)
         return {
             "success": True,
+            "error_code": None,
             "sandbox_path": remote_path,
             "size": len(content),
             "error": None,
@@ -210,9 +255,12 @@ async def upload_to_sandbox(
     except Exception as e:
         return {
             "success": False,
+            "error_code": "sandbox_write_failed",
+            "error": f"连接/写入沙箱 {sandbox_id} 失败: {e}",
+            "virtual_path": original_path,
+            "physical_path": file_path,
             "sandbox_path": None,
             "size": 0,
-            "error": f"连接/写入沙箱 {sandbox_id} 失败: {e}",
         }
 
 
@@ -232,25 +280,41 @@ async def decrypt_and_upload_to_sandbox(
     解密后的明文会写入沙箱文件系统，不经过 LLM 上下文，不落地宿主机磁盘。
 
     Args:
-        file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}）
+        file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}、
+                   /reports/...）或 MCP server 物理路径；自动转换
         remote_path: 沙箱内的目标路径（如 /home/user/data.xlsx）
         sandbox_id: 目标沙箱 ID，从聊天上下文的"沙箱 ID"字段获取
 
     Returns:
-        {"success": bool, "sandbox_path": str | None, "size": int, "error": str | None}
+        {"success": bool, "error_code": str | None, "sandbox_path": str | None,
+         "size": int, "error": str | None}
+        失败时另带 virtual_path / physical_path / size_human / max_upload_mb / hint。
+        大小上限由 MCP_MAX_UPLOAD_MB 控制（默认 2048 MiB）；解密超时由
+        DECRYPT_TIMEOUT_S 控制（默认 600s）。
     """
     # 路径转换：虚拟路径 → 物理路径（复用 _resolve_host_path，与 upload_to_sandbox 一致，
     # 同时支持 /uploads/ 与 /reports/，消除原实现只认 /uploads/ 的盲区）
+    original_path = file_path
     file_path = _resolve_host_path(file_path)
+
+    # ── Stage 1 预检：与 upload_to_sandbox 共用同一套 ──
+    # 本工具会被模型直接调用（2026-10-09 会话 cecfdd84 就是绕道它+decrypt_file_to_base64），
+    # 所以预检不能只挂在 upload_to_sandbox 上。
+    bad = _upload_precheck(file_path, original_path)
+    if bad:
+        return bad
 
     # 1. 解密到内存
     result = await _decrypt_file_internal(file_path)
     if not result["success"]:
         return {
             "success": False,
+            "error_code": result.get("error_code") or "decrypt_failed",
+            "error": result["error"],
+            "virtual_path": original_path,
+            "physical_path": file_path,
             "sandbox_path": None,
             "size": 0,
-            "error": result["error"],
         }
 
     # E2B API 配置已通过 load_dotenv() 从 .env 加载到 os.environ
@@ -267,6 +331,7 @@ async def decrypt_and_upload_to_sandbox(
         sb.files.write(remote_path, result["data"])
         return {
             "success": True,
+            "error_code": None,
             "sandbox_path": remote_path,
             "size": len(result["data"]),
             "error": None,
@@ -274,9 +339,12 @@ async def decrypt_and_upload_to_sandbox(
     except Exception as e:
         return {
             "success": False,
+            "error_code": "sandbox_write_failed",
+            "error": f"连接/写入沙箱 {sandbox_id} 失败: {e}",
+            "virtual_path": original_path,
+            "physical_path": file_path,
             "sandbox_path": None,
             "size": 0,
-            "error": f"连接/写入沙箱 {sandbox_id} 失败: {e}",
         }
     # ☝️ 注意：不调 sb.kill()，沙箱由 Agent 管理
     #    connect 创建的对象会在函数返回后被 Python GC 回收
@@ -284,51 +352,87 @@ async def decrypt_and_upload_to_sandbox(
 
 
 async def _decrypt_file_internal(file_path: str) -> dict:
-    """内部解密函数（供其他函数调用）"""
+    """内部解密函数（供其他函数调用）
+
+    Stage 1 改动：
+      - 超时由硬编码 30s 改为 DECRYPT_TIMEOUT_S（默认 600s）——256MiB 级文件的
+        上传+解密远超 30s，原值会把"内存够但慢"的文件误伤成超时失败。
+      - 失败带回 error_code（file_not_found / decrypt_timeout / decrypt_api_error /
+        decrypt_failed），并保留原始异常文本，供上层拼结构化错误。
+      - 非 200 响应附带响应体片段（截断），便于分辨是网关参数问题还是 5xx。
+
+    注：此处 `f.read()` 全量读是 2N 峰值中"第二份"的来源（解密请求体），
+    Stage 1 保留（httpx 的 multipart files= 需要已知长度的字节串），
+    改流式需连同沙箱写入一起改，已列入 Stage 2 spike。
+    """
     try:
         # 读取原始加密文件
         with open(file_path, "rb") as f:
             file_content = f.read()
-
-        # 调用解密API
-        files = {
-            "file": (
-                os.path.basename(file_path),
-                file_content,
-            )
+    except OSError as e:
+        return {
+            "success": False,
+            "error_code": "file_not_found",
+            "data": None,
+            "error": f"读取待解密文件失败: {e}（物理路径 {file_path}）",
+            "size": 0,
         }
 
-        # response = requests.post(
-        #     decrypt_api_url,
-        #     files=files,
-        #     timeout=30,
-        # )
-        async with httpx.AsyncClient(timeout=30) as client:
+    # 调用解密API
+    files = {
+        "file": (
+            os.path.basename(file_path),
+            file_content,
+        )
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=DECRYPT_TIMEOUT_S) as client:
             response = await client.post(
                 decrypt_api_url,
                 files=files,
             )
-
-        if response.status_code != 200:
-            return {
-                "success": False,
-                "data": None,
-                "error": f"解密API返回错误{response.status_code}",
-                "size": 0,
-            }
-        return {
-            "success": True,
-            "data": response.content,
-            "error": None,
-            "size": len(response.content),
-        }
-    except Exception as e:
+    except httpx.TimeoutException as e:
         return {
             "success": False,
+            "error_code": "decrypt_timeout",
             "data": None,
-            "error": str(e),
+            "error": (
+                f"解密API超时（当前上限 {DECRYPT_TIMEOUT_S}s，文件 {_human_size(len(file_content))}）: {e}。"
+                f"若确认是正常大文件，可调高环境变量 DECRYPT_TIMEOUT_S 后重试。"
+            ),
             "size": 0,
         }
+    except Exception as e:
+        # 解密网关不可达 / TLS 校验失败等——原实现只回 str(e)，
+        # 不说是哪一步、连的哪个地址，排查时只能猜，这里补全上下文。
+        return {
+            "success": False,
+            "error_code": "decrypt_failed",
+            "data": None,
+            "error": f"调用解密API失败（{decrypt_api_url}）: {type(e).__name__}: {e}",
+            "size": 0,
+        }
+
+    if response.status_code != 200:
+        return {
+            "success": False,
+            "error_code": "decrypt_api_error",
+            "data": None,
+            "error": (
+                f"解密API返回错误 {response.status_code}"
+                f"（{decrypt_api_url}，文件 {_human_size(len(file_content))}）: "
+                f"{response.content[:300].decode('utf-8', 'replace')}"
+            ),
+            "size": 0,
+        }
+    return {
+        "success": True,
+        "error_code": None,
+        "data": response.content,
+        "error": None,
+        "size": len(response.content),
+    }
 
 
 # @mcp.tool()
@@ -483,14 +587,37 @@ async def decrypt_file_to_base64(file_path: str) -> dict:
     """
     解密文件并返回base64字符串（不写入磁盘）
 
-      :param file_path: 要解密的文件路径（加密状态）
+      :param file_path: 要解密的文件路径（加密状态）。支持虚拟路径
+                        （/uploads/{user_id}/{session_id}/{filename}、
+                        /reports/{user_id}/{session_id}/{filename}）与 MCP server
+                        物理路径，自动转换。
       :return: {"success": bool, "data": bytes, "error": str, "size": int}
+
+    ⚠️ 本工具把整个明文以 base64 返回给调用方（体积约为原文 1.33 倍，且会进入
+    LLM 上下文）。仅用于小文件的"可读性确认"；需要把大文件送进沙箱请用
+    upload_to_sandbox / decrypt_and_upload_to_sandbox。
+
+    Stage 1 旁支修复：原实现漏调 _resolve_host_path，传 /uploads/... 虚拟路径时
+    会直接 open() 该虚拟路径 → [Errno 2] No such file or directory，而报错里
+    只有虚拟路径、看不出是映射缺失（2026-10-09 会话 cecfdd84 实测 2 次，
+    并被模型误读为虚拟 FS 元数据不一致）。现与另两个上传工具对齐。
     """
+    # 路径转换：虚拟路径 → 物理路径（与 upload_to_sandbox /
+    # decrypt_and_upload_to_sandbox 一致；这是三者中唯一漏掉的，已补齐）
+    original_path = file_path
+    file_path = _resolve_host_path(file_path)
 
     result = await _decrypt_file_internal(file_path)
 
     if result["success"] and result["data"]:
         result["data"] = base64.b64encode(result["data"]).decode("utf-8")
+        result["virtual_path"] = original_path
+        result["physical_path"] = file_path
+    else:
+        # 失败时补上解析后的物理路径——只给虚拟路径会让调用方看不出是映射问题
+        result["virtual_path"] = original_path
+        result["physical_path"] = file_path
+        result["error"] = f"{result.get('error')}（虚拟路径 {original_path} → 物理路径 {file_path}）"
 
     return result
 
@@ -517,14 +644,21 @@ SCAN_MIN_AVG_CHARS = 50
 
 
 def _resolve_host_path(path: str) -> str:
-    """虚拟路径（/uploads/、/reports/）→ MCP server 物理路径；否则原样返回。"""
+    """虚拟路径（/uploads/、/reports/）→ MCP server 物理路径；否则原样返回。
+
+    幂等（Stage 1 补）：若传入的已经是解析后的物理路径（以对应 root 开头），原样返回。
+    必要性：upload_to_sandbox 会先把虚拟路径解析成物理路径，命中 DLP 后再把该物理路径
+    转交给 decrypt_and_upload_to_sandbox，而后者也会调本函数——若 UPLOAD_ROOT 恰好是
+    "/uploads" 这类与虚拟前缀重合的值，非幂等实现会二次前缀成 /uploads/uploads/...。
+    同时 _upload_precheck 需要在两个工具入口都拿到"稳定"的物理路径。
+    """
     if path.startswith("/uploads/"):
         root = os.environ.get("UPLOAD_ROOT", "")
-        if root:
+        if root and not path.startswith(root.rstrip("/") + "/"):
             return f"{root}/{path[len('/uploads/'):]}"
     if path.startswith("/reports/"):
         root = os.environ.get("REPORT_ROOT", "")
-        if root:
+        if root and not path.startswith(root.rstrip("/") + "/"):
             return f"{root}/{path[len('/reports/'):]}"
     return path
 
@@ -565,6 +699,79 @@ def _dlp_encrypted(file_path: str) -> bool:
         return any(head.startswith(sig) for sig in DLP_HEADER_SIGNATURES)
     except Exception:
         return False
+
+
+def _human_size(n: int) -> str:
+    """字节数 → 人类可读（结构化错误体与日志共用，避免各处重复拼字符串）。"""
+    f = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if f < 1024 or unit == "GiB":
+            return f"{f:.1f} {unit}" if unit != "B" else f"{int(f)} B"
+        f /= 1024
+    return f"{f:.1f} GiB"
+
+
+def _upload_precheck(physical_path: str, virtual_path: str) -> dict | None:
+    """上传前预检：物理路径存在性 + 文件大小上限。
+
+    返回 None 表示通过；返回 dict 表示结构化错误（直接作为工具返回值，不抛异常）。
+
+    设计要点（Stage 1）：
+      - 错误体同时给【虚拟路径】与【解析后的物理路径】+ 当前 UPLOAD_ROOT/REPORT_ROOT。
+        2026-10-09 事故里 MCP 只回虚拟路径，模型看不出是路径映射缺失，把
+        "No such file or directory" 误读成"虚拟文件系统元数据与数据不一致"，
+        进而引导用户重传文件（方向全错、浪费一轮）。
+      - 超限只在预检拦下，不进读文件路径——超限文件的失败方式从
+        "把共享容器内存撑爆"变成"一条可读的中文错误"。
+      - 沿用既有返回键（success / sandbox_path / size / error）保持向后兼容，
+        新增键为附加信息，老调用方不受影响。
+    """
+    if not os.path.isfile(physical_path):
+        return {
+            "success": False,
+            "error_code": "file_not_found",
+            "error": (
+                f"文件不存在：{physical_path}。调用传入的路径为 {virtual_path}；"
+                f"当前 UPLOAD_ROOT={os.environ.get('UPLOAD_ROOT', '(未设置)')}，"
+                f"REPORT_ROOT={os.environ.get('REPORT_ROOT', '(未设置)')}"
+            ),
+            "virtual_path": virtual_path,
+            "physical_path": physical_path,
+            "sandbox_path": None,
+            "size": 0,
+            "size_bytes": 0,
+            "max_upload_mb": MAX_UPLOAD_MB,
+            "hint": (
+                "请核对文件名与目录层级（虚拟路径形如 /uploads/{user_id}/{session_id}/{filename}）。"
+                "注意：本工具只认物理路径，不认 agent 侧虚拟文件系统；若文件确实存在，"
+                "多半是虚拟路径拼错或用的是沙箱内路径。"
+            ),
+        }
+
+    size = os.path.getsize(physical_path)
+    limit_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    if size > limit_bytes:
+        return {
+            "success": False,
+            "error_code": "file_too_large",
+            "error": (
+                f"文件超过上传上限：{physical_path} 实际 {_human_size(size)}（{size} 字节），"
+                f"上限 {MAX_UPLOAD_MB} MiB（{limit_bytes} 字节）。"
+                f"请在沙箱内用脚本处理，或拆分为多个较小文件后分别上传。"
+            ),
+            "virtual_path": virtual_path,
+            "physical_path": physical_path,
+            "sandbox_path": None,
+            "size": size,
+            "size_bytes": size,
+            "size_human": _human_size(size),
+            "max_upload_mb": MAX_UPLOAD_MB,
+            "hint": (
+                f"上限由环境变量 MCP_MAX_UPLOAD_MB 控制（当前 {MAX_UPLOAD_MB}）；"
+                "如需放宽请运维调整后重建 MCP 服务。"
+            ),
+        }
+    return None
 
 
 async def _sandbox_write(sandbox_id: str, path: str, content: bytes) -> dict:
