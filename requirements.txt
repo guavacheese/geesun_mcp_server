@@ -1,6 +1,13 @@
 # 依赖与 pyproject.toml / uv.lock 严格对齐（生产镜像可复现，避免 dev/prod 漂移）
 # 解析版本取自本仓库 uv.lock（Python 3.13）。
 fastmcp==3.2.4
+# ★ e2b 必须显式锁：它是 e2b-code-interpreter 的传递依赖，本文件不写就会每次
+#   构建装到最新版。2026-10-17 实测：1.0.3 里是 2.46.0，1.0.4 重建时飘到 2.56.0，
+#   结果 MCP 侧 `E2BSandbox.connect(sandbox_id)` 抛
+#   `Expecting value: line 1 column 1 (char 0)`（控制面响应解析失败），
+#   所有 upload_to_sandbox / 解密上传全挂，而 agent 侧建箱一切正常。
+#   与 CubeSandbox（cube-api 172.16.66.13:6000）配套的可用版本是 2.46.0。
+e2b==2.46.0
 e2b-code-interpreter==2.8.1
 httpx==0.28.1
 requests==2.33.1

@@ -1084,8 +1084,362 @@ async def run_pdf_diff_stage3(
     }
 
 
+# ══════════════════════════════════════════════════════════════════════
+# OCR 提取（2026-10-17 新增）
+# ══════════════════════════════════════════════════════════════════════
+# 为什么做成 MCP tool，而不是再加一份 skill 文档 / prompt 提示：
+#   四次实锤（aaf95335 / 60697463 / 80af41e4 / 83345f0c）——模型从不翻 /opt/ocr/，
+#   每次都自己现写 OCR 脚本，且失败后一律归因为"环境/库不兼容"：
+#     · 60697463 / 80af41e4：裸 PaddleOCR 撞 paddle 3.3.1 的 oneDNN C++ 崩溃
+#       （ConvertPirAttribute2RuntimeAttribute … onednn_instruction.cc:116），
+#       对外宣称"PaddleOCR 与当前环境 C++ 级不兼容，无法使用"；
+#     · 83345f0c：改用 PaddleOCR 2.x 的参数名（use_gpu / show_log）调 3.x，
+#       抛 ValueError: Unknown argument，又归因为"API compatibility issues"，
+#       转 pytesseract → 中文满屏乱码（RERLEDES, BRE.），最终烧满
+#       recursion_limit=200 且零交付。
+#   共同点：**模型不会去找入口**。加指路牌（文档/提示）无效，必须把入口放进
+#   tool list —— schema 常驻、参数被强制，模型不需要知道 PaddleOCR 的版本差异。
+#   沙箱内复用 /opt/ocr/ocr_run.py（v1.1.0：enable_mkldnn=False + det 边长 1500 +
+#   dpi 保护 + 逐页容错）。本工具不改它，只负责搬运、分页与收口。
+
+_OCR_ENTRY = "/opt/ocr/ocr_run.py"
+_OCR_WORKDIR = "/home/user/_ocr"
+_OCR_PREVIEW_CHARS = 2000
+_OCR_DPI_MIN, _OCR_DPI_MAX = 100, 200
+
+# 沙箱内的小工具：报页数 / 按页下标拆子 PDF。单独成文件，避免把路径拼进
+# `python3 -c` 的引号里（路径含空格/中文/引号时会碎）。
+_OCR_HELPER_PY = '''# -*- coding: utf-8 -*-
+import sys
+import pymupdf
+
+src = sys.argv[1]
+doc = pymupdf.open(src)
+if len(sys.argv) > 2:
+    idx = [int(x) for x in sys.argv[2:]]
+    out = pymupdf.open()
+    for i in idx:
+        out.insert_pdf(doc, from_page=i, to_page=i)
+    out.save(src + ".sub.pdf")
+print(doc.page_count)
+'''
+
+
+def _parse_page_spec(spec: str, page_count: int) -> tuple[list[int] | None, str | None]:
+    """把 "all" / "1-5" / "3,7,9" / "12" 解析为 0-based 页下标（去重升序）。
+
+    返回 (pages, error)。pages=None 表示"全量，无需拆分"。
+    纯函数、不碰 IO —— 单测直接喂参数（见 tests/test_ocr_page_spec.py）。
+    """
+    if spec is None:
+        return None, None
+    raw = str(spec).strip().lower()
+    if raw in ("", "all", "*"):
+        return None, None
+    picked: set[int] = set()
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, _, b = chunk.partition("-")
+            try:
+                start, end = int(a), int(b)
+            except ValueError:
+                return None, f"页范围无法解析: {chunk!r}（期望形如 1-5）"
+            if start > end:
+                return None, f"页范围起点大于终点: {chunk!r}"
+            rng = list(range(start, end + 1))
+        else:
+            try:
+                rng = [int(chunk)]
+            except ValueError:
+                return None, f"页号无法解析: {chunk!r}"
+        for p in rng:
+            if p < 1:
+                return None, f"页号从 1 开始，收到 {p}"
+            if page_count and p > page_count:
+                return None, f"页号 {p} 超出总页数 {page_count}"
+            picked.add(p - 1)
+    if not picked:
+        return None, "页选择为空"
+    return sorted(picked), None
+
+
+def _first_json_value(raw: str):
+    """从混杂 stdout 里抠出第一个"像结果集"的 JSON 值。
+
+    为什么需要：`ocr_run.py --json` 的输出**并不纯净** —— paddleocr 3.x 初始化时
+    会往 stdout 打模型源探测结果（2026-10-17 实测：result.json 36904 字节、
+    正文完全正常，但前两行是 `<Response [404]>`），直接 json.loads 会报
+    `Expecting value: line 1 column 1 (char 0)`，看起来像"OCR 失败了"，
+    实际只是被第三方库的调试输出污染了前两行。
+
+    ★ 不能只取"第一个能解析的 JSON"：污染行 `<Response [404]>` 里的 `[404]`
+    本身就是合法 JSON 数组，会被先抓住，返回 `[404]` 而不是真正的页结果。
+    故必须按**结构**筛选：接受 dict，或"元素为 dict 的 list"；
+    `[404]` 这类纯标量数组跳过，继续往后找。
+
+    纯函数、不碰 IO —— 单测见 tests/test_ocr_pdf_to_text.py。
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    dec = json.JSONDecoder()
+    s = raw.lstrip()
+    for i, ch in enumerate(s):
+        if ch not in "[{":
+            continue
+        try:
+            val = dec.raw_decode(s[i:])[0]
+        except ValueError:
+            continue
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, list) and (not val or isinstance(val[0], dict)):
+            return val
+    return None
+
+
+@mcp.tool()
+async def ocr_pdf_to_text(
+    file_path: str,
+    sandbox_id: str,
+    pages: str = "all",
+    dpi: int = 150,
+    sandbox_pdf_path: str | None = None,
+) -> dict:
+    """对扫描件/图片型 PDF 做 OCR 并返回文本。**这是本环境唯一的 OCR 入口。**
+
+    已内置全部正确参数，不要自己写 OCR 脚本、不要 pip install、不要直接调
+    PaddleOCR(...) 或 pytesseract —— 那些写法在本沙箱里会失败，且报错会误导你：
+      · 裸 PaddleOCR 会撞 paddle 的 oneDNN C++ 崩溃（onednn_instruction.cc:116），
+        看起来像"库与环境不兼容"，其实只是少了 enable_mkldnn=False；
+      · PaddleOCR 3.x 已删除 use_gpu / show_log 参数，照 2.x 写法传会抛
+        ValueError: Unknown argument；
+      · pytesseract 没装中文包，出来的是乱码。
+    本工具把这些都处理好了，你只需要给路径。
+
+    Args:
+        file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}）或
+            宿主物理路径。自动识别 DLP 加密并解密后上传（明文不落盘）。
+        sandbox_id: 目标沙箱 ID（用当前会话的沙箱）。
+        pages: 页选择。"all"（默认，全量）| "1-5" | "3,7,9" | "12"。
+            只关心部分页时务必指定 —— 262 页全量 OCR 约 400 秒，抽 5 页只要十几秒。
+        dpi: PDF 渲染 DPI，100~200，默认 150。超过 200 在 8GB 沙箱上有 OOM 风险。
+        sandbox_pdf_path: 可选。若 PDF 已经在沙箱里（之前上传过），直接给沙箱路径，
+            省掉一次上传（大文件可省几十秒）。
+
+    Returns:
+        {"success": bool, "step": str|None, "error": str|None,
+         "pages_total": int, "pages_ocred": int, "pages_failed": int,
+         "total_texts": int, "elapsed_sec": float,
+         "payload_json": str,   # 沙箱内逐页结构化结果（page/texts/scores）
+         "payload_txt": str,    # 沙箱内纯文本，带 "===== page N =====" 分隔
+         "preview": str,        # 前 2000 字符，够判断内容对不对
+         "warnings": [str]}
+        全文不会放进返回值（262 页会直接撑爆上下文）：需要细节时用 read_file
+        读 payload_txt，或按页再调一次本工具（pages="10-20"）。
+    """
+    import shlex
+    import time as _time
+
+    t0 = _time.time()
+
+    if not _is_valid_sandbox_id(sandbox_id):
+        return _fail("validate", f"非法 sandbox_id: {sandbox_id!r}")
+    if not (_OCR_DPI_MIN <= int(dpi) <= _OCR_DPI_MAX):
+        return _fail(
+            "validate",
+            f"dpi 必须在 {_OCR_DPI_MIN}~{_OCR_DPI_MAX} 之间，收到 {dpi}"
+            "（超过 200 在 8GB 沙箱上有 OOM 风险；低于 100 会严重漏检）",
+        )
+
+    # ── S1：定位沙箱内的 PDF ──
+    import asyncio as _asyncio
+    import shlex
+
+    if sandbox_pdf_path:
+        src_pdf = sandbox_pdf_path
+        chk = await _sandbox_run(sandbox_id, "test -f %s && echo OK" % shlex.quote(src_pdf), timeout=60)
+        if "OK" not in (chk.get("stdout") or ""):
+            return _fail("locate", f"sandbox_pdf_path 不存在: {src_pdf}")
+    else:
+        phys = _resolve_host_path(file_path)
+        bad = _upload_precheck(phys, file_path)
+        if bad:
+            return bad
+        src_pdf = "%s/%s" % (_OCR_WORKDIR, os.path.basename(phys))
+        # ★ 必须重试：沙箱刚 get_or_create 出来时 envd 还没就绪，e2b 的
+        #   connect/files.write 会拿到空响应 → `Expecting value: line 1 column 1`。
+        #   2026-10-17 实测：建箱后立刻调，9s 就失败；等模型聊两轮再调就成功。
+        #   既有 upload_to_sandbox 没有重试（它历史上一直是被"已经聊了一会儿"的
+        #   会话调用），本工具是第一个会紧贴建箱调用的，故在此自保。
+        last_err = None
+        for attempt in range(4):
+            prep = await _sandbox_run(
+                sandbox_id, "mkdir -p %s" % shlex.quote(_OCR_WORKDIR), timeout=60
+            )
+            if prep.get("success"):
+                up = await upload_to_sandbox(file_path, src_pdf, sandbox_id)
+                if up.get("success"):
+                    last_err = None
+                    break
+                last_err = up.get("error")
+            else:
+                last_err = prep.get("stderr")
+            if attempt < 3:
+                await _asyncio.sleep(3)
+        if last_err:
+            return _fail("upload", f"上传沙箱失败（已重试 4 次）: {str(last_err)[:400]}")
+
+    # ── S2：沙箱是否具备 OCR 入口（旧模板会让模型重走"自己写脚本"的老路）──
+    # ★ 必须 echo OK：本判据读的是 stdout 里有没有 OK，而 grep 命中的输出是
+    #   `__version__ = "1.1.0"`，不含 OK。漏掉 echo 会让 precheck 恒失败
+    #   （2026-10-17 实测踩到：明明文件在，却报"模板过旧"）。
+    env = await _sandbox_run(
+        sandbox_id,
+        "test -f %s && grep -m1 '^__version__' %s && echo OK"
+        % (_OCR_ENTRY, _OCR_ENTRY),
+        timeout=60,
+    )
+    if "OK" not in (env.get("stdout") or ""):
+        return _fail(
+            "precheck",
+            f"沙箱内缺少 {_OCR_ENTRY}（模板过旧）。请在 ocr-20g-v4 及以上模板重建沙箱后再试。",
+        )
+
+    # ── S3：页数 + 可选拆分 ──
+    helper = "%s/_page.py" % _OCR_WORKDIR
+    w = await _sandbox_write(sandbox_id, helper, _OCR_HELPER_PY.encode("utf-8"))
+    if not w["success"]:
+        return _fail("prepare", w["error"])
+
+    cnt = await _sandbox_run(
+        sandbox_id, "python3 %s %s" % (shlex.quote(helper), shlex.quote(src_pdf)), timeout=180
+    )
+    try:
+        page_count = int((cnt.get("stdout") or "0").strip().splitlines()[-1])
+    except Exception:
+        page_count = 0
+    if page_count <= 0:
+        return _fail("prepare", f"读取页数失败: {(cnt.get('stderr') or '')[:300]}")
+
+    want, perr = _parse_page_spec(pages, page_count)
+    if perr:
+        return _fail("validate", perr)
+
+    target_pdf = src_pdf
+    if want is not None:
+        sub = src_pdf + ".sub.pdf"
+        sp = await _sandbox_run(
+            sandbox_id,
+            "python3 %s %s %s" % (
+                shlex.quote(helper), shlex.quote(src_pdf), " ".join(str(i) for i in want)
+            ),
+            timeout=600,
+        )
+        if not sp.get("success"):
+            return _fail("split", f"按页拆分失败: {(sp.get('stderr') or '')[:300]}")
+        target_pdf = sub
+
+    # ── S4：跑 OCR（输出重定向到文件：stdout 直传会被 e2b 截断）──
+    out_json = "%s/result.json" % _OCR_WORKDIR
+    out_err = "%s/err.log" % _OCR_WORKDIR
+    n_pages = page_count if want is None else len(want)
+    budget = max(300, min(3600, n_pages * 25))
+    cmd = (
+        "mkdir -p %s && python3 %s %s --json --dpi %d > %s 2> %s; echo \"EXIT=$?\""
+        % (
+            shlex.quote(_OCR_WORKDIR),
+            shlex.quote(_OCR_ENTRY),
+            shlex.quote(target_pdf),
+            int(dpi),
+            shlex.quote(out_json),
+            shlex.quote(out_err),
+        )
+    )
+    run = await _sandbox_run(sandbox_id, cmd, timeout=budget)
+    m = re.search(r"EXIT=(\d+)", run.get("stdout") or "")
+    exit_code = int(m.group(1)) if m else -1
+
+    warnings: list[str] = []
+    if exit_code == 2:
+        warnings.append("OCR 未识别出任何文字（页面可能是纯图无文字/分辨率过低）")
+    elif exit_code not in (0, 2):
+        tail = await _sandbox_run(sandbox_id, "tail -n 3 %s" % shlex.quote(out_err), timeout=60)
+        warnings.append(
+            "OCR 部分页失败（exit=%d）：%s" % (exit_code, (tail.get("stdout") or "").strip()[:300])
+        )
+
+    # ── S5：读回结果，拼纯文本，只回摘要 + 预览 ──
+    rd = await _sandbox_read(sandbox_id, out_json)
+    if not rd["success"] or not rd["data"]:
+        tail = await _sandbox_run(sandbox_id, "tail -n 5 %s" % shlex.quote(out_err), timeout=60)
+        return _fail(
+            "read",
+            "沙箱内未生成可读的 result.json：%s | stderr=%s"
+            % (rd.get("error"), (tail.get("stdout") or "")[-300:]),
+        )
+    raw_text = bytes(rd["data"]).decode("utf-8", errors="replace")
+    recs = _first_json_value(raw_text)
+    if recs is None:
+        tail = await _sandbox_run(sandbox_id, "tail -n 8 %s" % shlex.quote(out_err), timeout=60)
+        return _fail(
+            "parse",
+            "result.json 里没有可用 JSON：head=%r | stderr=%s"
+            % (raw_text[:200], (tail.get("stdout") or "")[-300:]),
+        )
+
+    if not isinstance(recs, list):
+        return _fail("parse", "result.json 结构异常（期望 list）")
+
+    # 子 PDF 的 page 序号 → 原 PDF 页号
+    mapping = {i + 1: (want[i] + 1 if want is not None else i + 1) for i in range(len(recs))}
+    chunks: list[str] = []
+    total_texts = 0
+    failed = 0
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+        sub_no = int(rec.get("page") or 0)
+        real_no = mapping.get(sub_no, sub_no)
+        texts = rec.get("texts") or []
+        total_texts += len(texts)
+        if not rec.get("ok"):
+            failed += 1
+        chunks.append("===== page %d =====" % real_no)
+        chunks.append("\n".join(str(t) for t in texts) if texts else "(无文本)")
+        chunks.append("")
+    body = "\n".join(chunks)
+    out_txt = "%s/result.txt" % _OCR_WORKDIR
+    tw = await _sandbox_write(sandbox_id, out_txt, body.encode("utf-8"))
+    if not tw["success"]:
+        warnings.append("纯文本回写失败：%s" % tw.get("error"))
+
+    if want is not None:
+        warnings.append("已按 pages=%r 只 OCR %d/%d 页" % (pages, len(want), page_count))
+    if dpi > 150:
+        warnings.append("dpi=%d 高于默认 150，单页耗时约为 150dpi 的 2 倍以上" % int(dpi))
+
+    return {
+        "success": failed == 0 or total_texts > 0,
+        "step": None,
+        "error": None,
+        "pages_total": page_count,
+        "pages_ocred": len(recs),
+        "pages_failed": failed,
+        "total_texts": total_texts,
+        "elapsed_sec": round(_time.time() - t0, 1),
+        "payload_json": out_json,
+        "payload_txt": out_txt,
+        "preview": body[:_OCR_PREVIEW_CHARS],
+        "warnings": warnings,
+    }
+
+
 # @mcp.tool()
 # async def read_excel(file_path: str, sheet_name: Optional[str] = None) -> dict:
+
 #     """
 #     解密并读取 Excel 文件，返回结构化数据
 
