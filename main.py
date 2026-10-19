@@ -1447,10 +1447,16 @@ async def ocr_pdf_to_text(
         text = (st.get("stdout") or "").strip()
         return text or None
 
-    # ── 4a. 幂等续查 / 启动 ──
+    # ── 4a. 指纹一致性判定 + 幂等续查 / 启动 ──
+    # ★ 指纹判定必须先于 done.flag 分支：完成信号是上一次（不同参数组合）
+    #   任务留下时，其 result.json 对本次无效——直接收会读到别的页范围的
+    #   产物（页数更少时 _ocr_collect 的 mapping 还会 IndexError，
+    #   2026-10-19 e2e T4：pages="1" 收 pages="1-2" 的 2 条记录实锤）。
+    prev_fp = await _read_fingerprint()
     done_code = await _poll_done()
+    if done_code is not None and prev_fp != fingerprint:
+        done_code = None  # 作废旧完成信号，按新指纹重跑（bg_cmd 会清场）
     if done_code is None:
-        prev_fp = await _read_fingerprint()
         has_result = (
             await _sandbox_run(
                 sandbox_id, "test -f %s && echo OK" % shlex.quote(out_json), timeout=30
@@ -1529,6 +1535,15 @@ async def ocr_pdf_to_text(
         done_code = await _poll_done()
 
     # ── 4c. 进程结束：按退出码分流 ──
+    # 终验指纹：轮询期间若有别的参数组合的任务也写了 done.flag，此时收上来
+    # 的会是它的产物——宁可显式失败让模型重试，也不返回错页范围的数据。
+    final_fp = await _read_fingerprint()
+    if final_fp is not None and final_fp != fingerprint:
+        return _fail(
+            "stale",
+            "沙箱内 OCR 产物与本次参数指纹不一致（可能有多参数任务并发），"
+            "请稍后用相同参数重试或换 sandbox_id",
+        )
     warnings: list[str] = []
     try:
         exit_code = int(done_code)
@@ -1589,8 +1604,13 @@ async def _ocr_collect(
     if not isinstance(recs, list):
         return _fail("parse", "result.json 结构异常（期望 list）")
 
-    # 子 PDF 的 page 序号 → 原 PDF 页号
-    mapping = {i + 1: (want[i] + 1 if want is not None else i + 1) for i in range(len(recs))}
+    # 子 PDF 的 page 序号 → 原 PDF 页号。want 比 recs 短时（理论上是
+    # 指纹不一致的脏数据被收了上来）不得 IndexError——退化为恒等映射，
+    # 由上游指纹终验兜底；这里只保证不崩。
+    mapping = {
+        i + 1: (want[i] + 1 if want is not None and i < len(want) else i + 1)
+        for i in range(len(recs))
+    }
     chunks: list[str] = []
     total_texts = 0
     failed = 0

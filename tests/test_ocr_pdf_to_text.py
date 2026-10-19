@@ -357,3 +357,170 @@ def test_wait_loop_has_deadline_exit():
         "轮询循环里找不到以 deadline 比较为条件的出口——"
         "工具会无限期等待，重演 653d8515 的挂死形态"
     )
+
+
+# ────────── 陈旧 done.flag / 指纹错配回归（2026-10-19 e2e T4 实锤）──────────
+
+
+def _load_ocr_module():
+    """把 ocr_pdf_to_text 及其依赖（_ocr_collect/_fail/_parse_page_spec/常量）
+    摘进同一命名空间，返回可 await 调用的真函数——不 import main（重依赖）。"""
+    src = _src()
+    tree = ast.parse(src)
+    want_names = {"ocr_pdf_to_text", "_ocr_collect", "_fail", "_parse_page_spec",
+                  "_first_json_value"}
+    body = [n for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in want_names]
+    assert len(body) == len(want_names), "依赖函数不全：%s" % [n.name for n in body]
+    for n in body:
+        n.decorator_list = []  # 剥掉 @mcp.tool() 等装饰器——ns 里没有 mcp
+    # 模块级常量按需注入（_OCR_ENTRY/_OCR_WORKDIR/_OCR_DPI_*/_OCR_WAIT_MAX/
+    # _OCR_POLL_INTERVAL/_OCR_HELPER_PY/_OCR_PREVIEW_CHARS）
+    consts = {}
+    for n in tree.body:
+        if not isinstance(n, ast.Assign):
+            continue
+        # 兼容 `A, B = 1, 2` 元组赋值（_OCR_DPI_MIN/_OCR_DPI_MAX）
+        targets = n.targets[0].elts if isinstance(n.targets[0], ast.Tuple) else [n.targets[0]]
+        values = (n.value.elts if isinstance(n.value, ast.Tuple) else [n.value] * len(targets))
+        for tgt, val in zip(targets, values):
+            if isinstance(tgt, ast.Name) and tgt.id.startswith("_OCR_"):
+                try:
+                    consts[tgt.id] = ast.literal_eval(val)
+                except (ValueError, SyntaxError):
+                    pass  # _OCR_HELPER_PY 等 literal_eval 吃不下就跳过
+    ns = {"json": json, "os": __import__("os"), "re": __import__("re"), **consts}
+    mod = ast.Module(body=body, type_ignores=[])
+    exec(compile(mod, str(MAIN_PY), "exec"), ns)  # noqa: S102
+    return ns
+
+
+class _FakeSandbox:
+    """按命令内容分发的假沙箱，重放 T4 现场：
+
+    done.flag 里留着上一次（pages=1-2）任务的退出码 0，ocr.meta 里是旧指纹，
+    result.json 是旧任务的两页产物。本次调用 pages="1"。
+    """
+
+    def __init__(self):
+        self.commands: list[str] = []
+        self.meta = "/home/user/_ocr/e2e.pdf|1-2|150"  # 旧指纹
+        self.done = "0"                                 # 陈旧完成信号
+        self.result_json = json.dumps(
+            [{"page": 1, "ok": True, "texts": ["OLD-1"]},
+             {"page": 2, "ok": True, "texts": ["OLD-2"]}]
+        )
+        self.fresh_result = json.dumps([{"page": 1, "ok": True, "texts": ["NEW-1"]}])
+
+    async def run(self, sandbox_id, cmd, timeout=None):
+        self.commands.append(cmd)
+        if cmd.startswith("test -f /home/user/_ocr/e2e.pdf"):
+            return {"success": True, "stdout": "OK\n", "stderr": ""}
+        if "grep -m1" in cmd:  # S2 环境预检
+            return {"success": True, "stdout": '__version__ = "1.1.0"\nOK\n', "stderr": ""}
+        if cmd.endswith("_page.py /home/user/_ocr/e2e.pdf"):  # 页数探测
+            return {"success": True, "stdout": "2\n", "stderr": ""}
+        if "_page.py /home/user/_ocr/e2e.pdf 0" in cmd:  # 按页拆分
+            return {"success": True, "stdout": "SPLIT_OK\n", "stderr": ""}
+        if cmd.startswith("cat ") and "done.flag" in cmd:
+            return {"success": True, "stdout": self.done + "\n", "stderr": ""}
+        if cmd.startswith("cat ") and "ocr.meta" in cmd:
+            return {"success": True, "stdout": self.meta + "\n", "stderr": ""}
+        if cmd.startswith("test -f ") and "result.json" in cmd:
+            return {"success": True, "stdout": "OK\n", "stderr": ""}
+        if "BG_STARTED" in cmd:  # 后台启动：新任务秒完
+            self.meta = "/home/user/_ocr/e2e.pdf|1|150"  # meta 先写后启动
+            return {"success": True, "stdout": "BG_STARTED\n", "stderr": ""}
+        return {"success": True, "stdout": "", "stderr": ""}
+
+    async def write(self, sandbox_id, path, data):
+        if path.endswith("ocr.meta"):
+            self.meta = data.decode("utf-8")
+        return {"success": True, "error": None}
+
+    async def read(self, sandbox_id, path):
+        # 启动后才换新产物：没收旧 flag 就直接读的（修复前）会拿到两页旧数据
+        fresh = any("BG_STARTED" in c for c in self.commands)
+        return {"success": True, "data": (self.fresh_result if fresh else self.result_json).encode(),
+                "error": None}
+
+
+def test_stale_done_flag_with_old_fingerprint_forces_relaunch():
+    """done.flag 在但指纹不匹配 ⇒ 必须作废重跑，不得收旧产物。
+
+    2026-10-19 e2e T4：pages="1" 收到 pages="1-2" 任务留下的 done.flag=0，
+    旧代码跳过指纹判定直接收集 ⇒ 读到 2 条旧记录，want=[0] 映射时
+    IndexError: list index out of range（ToolException 回灌，整轮报废）。
+    """
+    import asyncio as _asyncio
+
+    ns = _load_ocr_module()
+    sb = _FakeSandbox()
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+    ns["upload_to_sandbox"] = None  # 本路径不走上传
+    ns["_resolve_host_path"] = None
+    ns["_upload_precheck"] = None
+
+    r = _asyncio.run(ns["ocr_pdf_to_text"](
+        sandbox_id="sbx-test",
+        sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+        pages="1",
+        dpi=150,
+        wait_seconds=3,
+    ))
+
+    assert any("BG_STARTED" in c for c in sb.commands), (
+        "陈旧 done.flag + 旧指纹时必须重新启动后台任务（BG_STARTED）——"
+        "否则收的是上一次参数组合的产物"
+    )
+    assert r["success"] is True, r
+    assert r["status"] == "completed", r
+    assert r["pages_ocred"] == 1, "应只收新任务（pages=1）的 1 页结果，实际：%s" % r
+    assert r["total_texts"] == 1, r
+    assert "NEW-1" in r["preview"], "预览应来自新任务产物：%s" % r["preview"][:120]
+
+
+def test_ocr_collect_mapping_never_index_errors():
+    """_ocr_collect 的页号映射对短 want/长 recs 不得 IndexError（纵深防御）。"""
+    import asyncio as _asyncio
+
+    ns = _load_ocr_module()
+    recs = json.dumps([{"page": 1, "ok": True, "texts": ["A"]},
+                       {"page": 2, "ok": True, "texts": ["B"]}])
+
+    async def _read(sandbox_id, path):
+        return {"success": True, "data": recs.encode(), "error": None}
+
+    async def _write(sandbox_id, path, data):
+        return {"success": True, "error": None}
+
+    ns["_sandbox_read"] = _read
+    ns["_sandbox_write"] = _write
+    r = _asyncio.run(ns["_ocr_collect"](
+        "sbx", "/home/user/_ocr/result.json", "/home/user/_ocr/err.log",
+        2, [0], "1", 150, 0.0, [], 1,
+    ))
+    assert r["success"] is True, r
+    assert "===== page 1 =====" in r["preview"] and "===== page 2 =====" in r["preview"]
+
+
+def test_fingerprint_check_precedes_done_flag_branch():
+    """AST 顺序锚点：读指纹必须发生在 done.flag 分支判定之前。
+
+    防止"把 _read_fingerprint 挪回 if done_code is None 里"的回归——
+    那正是 T4 IndexError 的结构性根因（flag 在就永不验指纹）。
+    """
+    src = _src()
+    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    seg = _code_only(ast.get_source_segment(src, node))
+    i_fp = seg.find("prev_fp = await _read_fingerprint()")
+    i_branch = seg.find("if done_code is None:")
+    assert i_fp != -1, "找不到 prev_fp 读取"
+    assert i_branch != -1, "找不到 done.flag 分支"
+    assert i_fp < i_branch, (
+        "指纹读取被挪进了 done.flag 分支——完成信号存在时将永不校验指纹，"
+        "重演 T4 收旧产物 IndexError"
+    )
