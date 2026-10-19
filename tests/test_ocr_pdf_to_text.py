@@ -224,6 +224,28 @@ def test_default_pages_is_not_all():
     )
 
 
+def test_file_path_optional_with_either_or_guard():
+    """file_path 必须可选（与 sandbox_pdf_path 二选一），且有 either/or 校验。
+
+    2026-10-19 e2e 实锤：docstring 明说"PDF 已在沙箱里就直接给沙箱路径"，
+    但 file_path 是必填位——模型照文档只传 sandbox_pdf_path，被 pydantic
+    missing_argument 打回（ToolException 回灌自纠，浪费整轮）。契约必须
+    与文档一致：要么 file_path（自动解密上传），要么 sandbox_pdf_path。
+    """
+    src = _src()
+    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    seg = ast.get_source_segment(src, node)
+    m = re.search(r"file_path:\s*str\s*\|\s*None\s*=\s*None", seg)
+    assert m, (
+        "file_path 必须声明为 'str | None = None'——否则只传 sandbox_pdf_path "
+        "的调用会被 schema 校验拒绝（missing_argument）"
+    )
+    # either/or 校验必须在函数体内，且两个分支都判
+    assert re.search(r"not sandbox_pdf_path and not file_path", seg), (
+        "缺少 either/or 校验：file_path 与 sandbox_pdf_path 都为空时必须报错"
+    )
+
+
 def _code_only(seg: str) -> str:
     """剥掉注释行——断言"代码里不许出现 X"时，解释为什么不许用 X 的
     注释本身不该被判违规（test_background_launch_uses_done_flag 踩过）。

@@ -1240,8 +1240,8 @@ def _first_json_value(raw: str):
 
 @mcp.tool()
 async def ocr_pdf_to_text(
-    file_path: str,
     sandbox_id: str,
+    file_path: str | None = None,
     pages: str = "20",
     dpi: int = 150,
     sandbox_pdf_path: str | None = None,
@@ -1268,6 +1268,8 @@ async def ocr_pdf_to_text(
     Args:
         file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}）或
             宿主物理路径。自动识别 DLP 加密并解密后上传（明文不落盘）。
+            **与 sandbox_pdf_path 二选一即可**——PDF 已在沙箱里时只给
+            sandbox_pdf_path，不给本参数。
         sandbox_id: 目标沙箱 ID（用当前会话的沙箱）。
         pages: 页选择。"20"（默认，前 20 页）| "all"（全量，慎用）| "1-5" |
             "3,7,9" | "12"。**实测速度约 30s/页（150dpi、4 vCPU）**——262 页
@@ -1298,6 +1300,14 @@ async def ocr_pdf_to_text(
 
     if not _is_valid_sandbox_id(sandbox_id):
         return _fail("validate", f"非法 sandbox_id: {sandbox_id!r}")
+    if not sandbox_pdf_path and not file_path:
+        # either/or：文档明说"PDF 已在沙箱里就直接给沙箱路径"，file_path
+        # 若仍必填，模型照文档办事反而吃 pydantic missing_argument。
+        return _fail(
+            "validate",
+            "必须提供 file_path 或 sandbox_pdf_path 之一：PDF 不在沙箱时给 "
+            "file_path（自动解密上传），已在沙箱则给 sandbox_pdf_path",
+        )
     if not (_OCR_DPI_MIN <= int(dpi) <= _OCR_DPI_MAX):
         return _fail(
             "validate",
