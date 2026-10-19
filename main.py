@@ -135,8 +135,9 @@ async def copy_script_to_sandbox(
     # ── 同步段全部下沉 asyncio.to_thread ──
     # 2026-10-19 事故 653d8515：`async def` 工具里直接跑同步 e2b 调用
     # （connect/files.write/commands.run）会把 MCP 单事件循环堵满整个命令时长
-    # ——OCR 预算封顶 3600s，客户端 SSE 300s 读超时必死，重连请求在队列里
-    # 干等 55 分钟。e2b SDK 无 async 客户端，唯一解法是把同步段移出循环。
+    # ——OCR 预算封顶 3600s，实际堵了 55 分钟，期间所有请求（含重连）在队列里
+    # 干等，工具响应永远送不回 agent。e2b SDK 无 async 客户端，唯一解法是把
+    # 同步段移出循环。
     # 参照 deer-flow `sandbox/tools.py` 的 `_run_sync_tool_after_async_sandbox_init`。
     def _sync() -> dict:
         with open(found_path, "rb") as f:
@@ -1134,6 +1135,15 @@ _OCR_ENTRY = "/opt/ocr/ocr_run.py"
 _OCR_WORKDIR = "/home/user/_ocr"
 _OCR_PREVIEW_CHARS = 2000
 _OCR_DPI_MIN, _OCR_DPI_MAX = 100, 200
+#: 轮询间隔（秒）。事件循环已自由（同步段全在 to_thread），5s 粒度对
+#: SSE 心跳与响应性都足够；deer-flow McpTaskService 同为循环外轮询形态。
+_OCR_POLL_INTERVAL = 5
+#: 单次调用最长等待（秒）。硬边界来自 agent 侧 MCP 客户端：
+#: mcp SDK 的 streamablehttp_client 用同一个 httpx.AsyncClient 发 POST，
+#: 其 timeout=httpx.Timeout(t, read=sse_read_timeout) 默认 read=300s
+#: （streamable_http.py:104/711）——工具等更久也不会有人收，POST 到
+#: 300s 就被客户端 ReadTimeout 掐断。故 300 是"等到被掐"之前的极限。
+_OCR_WAIT_MAX = 300
 
 # 沙箱内的小工具：报页数 / 按页下标拆子 PDF。单独成文件，避免把路径拼进
 # `python3 -c` 的引号里（路径含空格/中文/引号时会碎）。
@@ -1232,9 +1242,10 @@ def _first_json_value(raw: str):
 async def ocr_pdf_to_text(
     file_path: str,
     sandbox_id: str,
-    pages: str = "all",
+    pages: str = "20",
     dpi: int = 150,
     sandbox_pdf_path: str | None = None,
+    wait_seconds: int = 90,
 ) -> dict:
     """对扫描件/图片型 PDF 做 OCR 并返回文本。**这是本环境唯一的 OCR 入口。**
 
@@ -1247,24 +1258,36 @@ async def ocr_pdf_to_text(
       · pytesseract 没装中文包，出来的是乱码。
     本工具把这些都处理好了，你只需要给路径。
 
+    **执行模型（2026-10-19 改，submit-and-poll）**：OCR 在沙箱内后台运行，
+    本工具最多等待 wait_seconds 秒。未完成时返回 status="running"（带进度提示），
+    **用完全相同的参数（file_path/sandbox_id/pages/dpi/sandbox_pdf_path）再调一次
+    即可续查或取回结果，不会重复上传、不会重复 OCR**（沙箱内按参数指纹复用）。
+    大文档推荐分批：pages="1-20" → "21-40" …，单批 20 页约 10 分钟（150dpi 实测
+    30s/页），每批一次调用，避免单次任务跑几十分钟。
+
     Args:
         file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}）或
             宿主物理路径。自动识别 DLP 加密并解密后上传（明文不落盘）。
         sandbox_id: 目标沙箱 ID（用当前会话的沙箱）。
-        pages: 页选择。"all"（默认，全量）| "1-5" | "3,7,9" | "12"。
-            只关心部分页时务必指定 —— 262 页全量 OCR 约 400 秒，抽 5 页只要十几秒。
+        pages: 页选择。"20"（默认，前 20 页）| "all"（全量，慎用）| "1-5" |
+            "3,7,9" | "12"。**实测速度约 30s/页（150dpi、4 vCPU）**——262 页
+            全量约 110 分钟，抽 20 页约 10 分钟。只关心部分页时务必指定。
         dpi: PDF 渲染 DPI，100~200，默认 150。超过 200 在 8GB 沙箱上有 OOM 风险。
         sandbox_pdf_path: 可选。若 PDF 已经在沙箱里（之前上传过），直接给沙箱路径，
             省掉一次上传（大文件可省几十秒）。
+        wait_seconds: 单次调用最长等待秒数，0~300，默认 90。超时未完成则返回
+            status="running"，按上面说明用相同参数再调。
 
     Returns:
         {"success": bool, "step": str|None, "error": str|None,
+         "status": "completed"|"running",
          "pages_total": int, "pages_ocred": int, "pages_failed": int,
          "total_texts": int, "elapsed_sec": float,
          "payload_json": str,   # 沙箱内逐页结构化结果（page/texts/scores）
          "payload_txt": str,    # 沙箱内纯文本，带 "===== page N =====" 分隔
          "preview": str,        # 前 2000 字符，够判断内容对不对
          "warnings": [str]}
+        status="running" 时另带 progress_hint（str）说明如何续查。
         全文不会放进返回值（262 页会直接撑爆上下文）：需要细节时用 read_file
         读 payload_txt，或按页再调一次本工具（pages="10-20"）。
     """
@@ -1281,6 +1304,9 @@ async def ocr_pdf_to_text(
             f"dpi 必须在 {_OCR_DPI_MIN}~{_OCR_DPI_MAX} 之间，收到 {dpi}"
             "（超过 200 在 8GB 沙箱上有 OOM 风险；低于 100 会严重漏检）",
         )
+    # wait_seconds 钳制而非报错：模型给 0 表示"只想提交/查一次"，给 9999
+    # 时按上限截断（300s 是 MCP 客户端 httpx read 超时，等更久没人收）。
+    wait_seconds = max(0, min(_OCR_WAIT_MAX, int(wait_seconds)))
 
     # ── S1：定位沙箱内的 PDF ──
     import asyncio as _asyncio
@@ -1370,34 +1396,166 @@ async def ocr_pdf_to_text(
             return _fail("split", f"按页拆分失败: {(sp.get('stderr') or '')[:300]}")
         target_pdf = sub
 
-    # ── S4：跑 OCR（输出重定向到文件：stdout 直传会被 e2b 截断）──
+    # ── S4：后台启动 OCR + 轮询等待（submit-and-poll 轻量版）──
+    # 2026-10-19 改。原实现是同步等命令跑完（budget 封顶 3600s），事故
+    # 653d8515 证明这条路必死：MCP 事件循环被同步 e2b 调用堵满命令时长
+    # （本次 55 分钟），工具响应送不回 agent；沙箱 TTL 3600s 无人续订，
+    # OCR 跑到约 60/110 分钟被连锅端。现改为：
+    #   1) nohup 后台跑（外层 bash 等 OCR 结束后写 done.flag + 退出码），
+    #      commands.run 只等 shell 退出（秒级）；
+    #   2) 启动前写 meta 指纹（src/pages/dpi），启动时清旧产物；
+    #   3) 轮询判据 = done.flag 文件。★ 不用 kill -0/PID：实测 e2b 每次
+    #      execute 是独立 PID namespace，跨会话 kill -0 恒 ALIVE——进程
+    #      自然退出 5s 后仍报活（2026-10-19 bgtest4 探针实锤），ps/pgrep
+    #      镜像里也没装。文件系统才是跨 namespace 的可靠信号源；
+    #   4) 相同指纹的后续调用直接复用已有结果，不重跑。
+    # 参照 deer-flow mcp/tasks/ 的 McpTaskDriver 状态机（简化版）。
     out_json = "%s/result.json" % _OCR_WORKDIR
     out_err = "%s/err.log" % _OCR_WORKDIR
+    out_done = "%s/done.flag" % _OCR_WORKDIR
+    out_meta = "%s/ocr.meta" % _OCR_WORKDIR
     n_pages = page_count if want is None else len(want)
-    budget = max(300, min(3600, n_pages * 25))
-    cmd = (
-        "mkdir -p %s && python3 %s %s --json --dpi %d > %s 2> %s; echo \"EXIT=$?\""
-        % (
-            shlex.quote(_OCR_WORKDIR),
-            shlex.quote(_OCR_ENTRY),
-            shlex.quote(target_pdf),
-            int(dpi),
-            shlex.quote(out_json),
-            shlex.quote(out_err),
-        )
-    )
-    run = await _sandbox_run(sandbox_id, cmd, timeout=budget)
-    m = re.search(r"EXIT=(\d+)", run.get("stdout") or "")
-    exit_code = int(m.group(1)) if m else -1
 
+    # 指纹：src_pdf + pages + dpi 全同才允许复用（pages 不同必须重跑，
+    # 否则会读到上一次页范围的产物——语义错误比浪费更严重）。
+    fingerprint = "%s|%s|%s" % (src_pdf, str(pages), int(dpi))
+
+    async def _poll_done() -> str | None:
+        """done.flag 的内容（退出码字符串）；不存在返回 None（仍在跑）。"""
+        st = await _sandbox_run(
+            sandbox_id,
+            "cat %s 2>/dev/null" % shlex.quote(out_done),
+            timeout=30,
+        )
+        text = (st.get("stdout") or "").strip()
+        return text or None
+
+    async def _read_fingerprint() -> str | None:
+        st = await _sandbox_run(
+            sandbox_id, "cat %s 2>/dev/null" % shlex.quote(out_meta), timeout=30
+        )
+        text = (st.get("stdout") or "").strip()
+        return text or None
+
+    # ── 4a. 幂等续查 / 启动 ──
+    done_code = await _poll_done()
+    if done_code is None:
+        prev_fp = await _read_fingerprint()
+        has_result = (
+            await _sandbox_run(
+                sandbox_id, "test -f %s && echo OK" % shlex.quote(out_json), timeout=30
+            )
+        )
+        if prev_fp == fingerprint and "OK" in (has_result.get("stdout") or ""):
+            # 兜底：done.flag 被清但结果还在且指纹一致 ⇒ 复用
+            warnings0: list[str] = ["复用沙箱内已有 OCR 结果（参数指纹一致，未重跑）"]
+            return await _ocr_collect(
+                sandbox_id, out_json, out_err, page_count, want, pages, dpi,
+                t0, warnings0, n_pages,
+            )
+        # 启动新的后台任务。启动命令退出码不可全信（e2b process 服务偶发
+        # 竞态：同一条命令实测两次一次 exit=1 一次 exit=0），以文件信号为准。
+        meta_write = await _sandbox_write(
+            sandbox_id, out_meta, fingerprint.encode("utf-8")
+        )
+        if not meta_write["success"]:
+            return _fail("prepare", meta_write["error"])
+        bg_cmd = (
+            "mkdir -p %s && rm -f %s %s %s && "
+            "nohup bash -c 'python3 %s %s --json --dpi %d > %s 2> %s; echo $? > %s' "
+            "</dev/null >/dev/null 2>&1 & echo BG_STARTED"
+            % (
+                shlex.quote(_OCR_WORKDIR),
+                shlex.quote(out_json),
+                shlex.quote(out_err),
+                shlex.quote(out_done),
+                shlex.quote(_OCR_ENTRY),
+                shlex.quote(target_pdf),
+                int(dpi),
+                shlex.quote(out_json),
+                shlex.quote(out_err),
+                shlex.quote(out_done),
+            )
+        )
+        await _sandbox_run(sandbox_id, bg_cmd, timeout=60)
+        done_code = await _poll_done()
+        # done_code 非 None ⇒ bash -c 秒退（python3 不存在/参数错等），
+        # 直接落到下面的退出码分流，不走轮询。
+
+    # ── 4b. 轮询等待（单次调用最多 wait_seconds 秒）──
+    deadline = _time.time() + wait_seconds
+    while done_code is None:
+        if _time.time() >= deadline:
+            tail = await _sandbox_run(
+                sandbox_id, "tail -n 2 %s 2>/dev/null" % shlex.quote(out_err), timeout=30
+            )
+            return {
+                "success": True,
+                "step": None,
+                "error": None,
+                "status": "running",
+                "pages_total": page_count,
+                "pages_ocred": 0,
+                "pages_failed": 0,
+                "total_texts": 0,
+                "elapsed_sec": round(_time.time() - t0, 1),
+                "payload_json": None,
+                "payload_txt": None,
+                "preview": "",
+                "warnings": [],
+                "progress_hint": (
+                    "OCR 仍在沙箱后台运行（本次已等待 %ds）。"
+                    "请用完全相同的参数再调一次本工具续查/取结果——"
+                    "参数指纹一致不会重复上传和 OCR。150dpi 实测约 30s/页，"
+                    "本批 %d 页可自行估算剩余时间；err.log 尾部：%s"
+                    % (
+                        wait_seconds,
+                        n_pages,
+                        (tail.get("stdout") or "").strip().replace("\n", " / ")[:200],
+                    )
+                ),
+            }
+        await _asyncio.sleep(_OCR_POLL_INTERVAL)
+        done_code = await _poll_done()
+
+    # ── 4c. 进程结束：按退出码分流 ──
     warnings: list[str] = []
+    try:
+        exit_code = int(done_code)
+    except (TypeError, ValueError):
+        exit_code = -1
     if exit_code == 2:
         warnings.append("OCR 未识别出任何文字（页面可能是纯图无文字/分辨率过低）")
     elif exit_code not in (0, 2):
         tail = await _sandbox_run(sandbox_id, "tail -n 3 %s" % shlex.quote(out_err), timeout=60)
         warnings.append(
-            "OCR 部分页失败（exit=%d）：%s" % (exit_code, (tail.get("stdout") or "").strip()[:300])
+            "OCR 执行失败（exit=%d）：%s" % (exit_code, (tail.get("stdout") or "").strip()[:300])
         )
+    return await _ocr_collect(
+        sandbox_id, out_json, out_err, page_count, want, pages, dpi,
+        t0, warnings, n_pages,
+    )
+
+
+async def _ocr_collect(
+    sandbox_id: str,
+    out_json: str,
+    out_err: str,
+    page_count: int,
+    want: list[int] | None,
+    pages: str,
+    dpi: int,
+    t0: float,
+    warnings: list[str],
+    n_pages: int,
+) -> dict:
+    """S5：读回 result.json，拼纯文本，只回摘要 + 预览。
+
+    从 ocr_pdf_to_text 抽出——submit-and-poll 改造后有三条路径汇到此处
+    （轮询等到完成 / 指纹复用 / 续查时进程已结束），收集逻辑只写一份。
+    """
+    import shlex
+    import time as _time
 
     # ── S5：读回结果，拼纯文本，只回摘要 + 预览 ──
     rd = await _sandbox_read(sandbox_id, out_json)
@@ -1453,6 +1611,7 @@ async def ocr_pdf_to_text(
         "success": failed == 0 or total_texts > 0,
         "step": None,
         "error": None,
+        "status": "completed",
         "pages_total": page_count,
         "pages_ocred": len(recs),
         "pages_failed": failed,

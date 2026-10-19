@@ -172,19 +172,166 @@ def test_first_json_value_edge_cases():
 
 
 def test_first_json_value_used_by_tool():
-    """接线：工具必须调 _first_json_value，而不是裸 json.loads。"""
+    """接线：结果收集必须调 _first_json_value，而不是裸 json.loads。
+
+    2026-10-19 submit-and-poll 改造后，收集逻辑搬到 _ocr_collect（三条路径
+    汇流：轮询完成 / 指纹复用 / 续查时进程已结束），锚点随之更新——断言的是
+    「收集函数走容错解析」这个不变量，不是某个具体函数名。
+    """
     src = _src()
-    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    node = _func_node(ast.parse(src), "_ocr_collect")
     body = ast.get_source_segment(src, node)
     assert "_first_json_value" in body, "解析必须走容错函数（第三方库会污染 stdout）"
 
 
 def test_return_contract_fields():
-    """返回值必须带 summary 字段且**不含全文**字段（262 页全文会撑爆上下文）。"""
+    """返回值必须带 summary 字段且**不含全文**字段（262 页全文会撑爆上下文）。
+
+    2026-10-19 submit-and-poll 改造后返回结构分两处：completed 契约在
+    _ocr_collect，running 契约在 ocr_pdf_to_text——并集检查。
+    """
     src = _src()
-    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
-    body = ast.get_source_segment(src, node)
+    tree = ast.parse(src)
+    body = ""
+    for name in ("ocr_pdf_to_text", "_ocr_collect"):
+        node = _func_node(tree, name)
+        body += ast.get_source_segment(src, node) or ""
     for key in ("pages_total", "pages_ocred", "pages_failed", "total_texts",
                 "payload_json", "payload_txt", "preview", "warnings"):
         assert f'"{key}"' in body, f"返回契约缺 {key}"
+    assert '"status"' in body, "submit-and-poll 契约缺 status 字段"
+    assert '"progress_hint"' in body, "running 分支缺 progress_hint"
     assert '"text"' not in body.replace('"texts"', ""), "返回值不应内联全文（会撑爆上下文）"
+
+
+# ────────────────── submit-and-poll 契约（2026-10-19）──────────────────
+
+
+def test_default_pages_is_not_all():
+    """pages 默认值不得是 "all"。
+
+    事故 653d8515：模型没传 pages ⇒ 262 页全量 OCR ≈110 分钟（30s/页实测），
+    而旧预算 min(3600, n*25) 封顶 60 分钟必砍。默认改 20 页后，模型即使
+    完全不传参也落在"一次调用能做完"的区间内。
+    """
+    src = _src()
+    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    seg = ast.get_source_segment(src, node)
+    m = re.search(r"pages:\s*str\s*=\s*\"([^\"]+)\"", seg)
+    assert m, "找不到 pages 参数声明"
+    assert m.group(1) != "all", (
+        f'pages 默认值又变回 "all"——全量 OCR 会重演 653d8515 的预算绞杀'
+    )
+
+
+def _code_only(seg: str) -> str:
+    """剥掉注释行——断言"代码里不许出现 X"时，解释为什么不许用 X 的
+    注释本身不该被判违规（test_background_launch_uses_done_flag 踩过）。
+    """
+    return "\n".join(
+        l for l in seg.splitlines() if not l.strip().startswith("#")
+    )
+
+
+def test_background_launch_uses_done_flag_not_pid_liveness():
+    """判活必须用 done.flag 文件，不得用 PID/kill -0。
+
+    2026-10-19 bgtest4 探针实锤：e2b 每次 execute 是独立 PID namespace，
+    跨 execute 会话 kill -0 对已死进程恒报 ALIVE（自然退出 5s 后仍"活"），
+    且镜像里 ps/pgrep 都没装。文件系统才是跨 namespace 的可靠信号源。
+    """
+    src = _src()
+    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    seg = _code_only(ast.get_source_segment(src, node))
+    assert "done.flag" in seg, "后台任务必须写 done.flag 作为完成信号"
+    assert "kill -0" not in seg, (
+        "kill -0 判活已证实不可靠（PID namespace 隔离），改用文件信号"
+    )
+    assert "nohup" in seg, "OCR 必须 nohup 后台化，否则 commands.run 会同步等到底"
+    # 启动命令必须把 shell 立即返回（& 后台化），否则退化成同步等待
+    assert re.search(r"&\s*echo\s+BG_STARTED", seg), (
+        "后台启动命令必须以 '& echo BG_STARTED' 收尾，确保秒级返回"
+    )
+
+
+def test_wait_seconds_clamped_to_mcp_client_hard_limit():
+    """wait_seconds 必须钳制，且上限等于 MCP 客户端的 httpx read 超时（300s）。
+
+    mcp SDK streamablehttp_client 用同一个 httpx.AsyncClient 发 POST，
+    timeout=httpx.Timeout(t, read=sse_read_timeout)，sse_read_timeout
+    默认 60*5=300s（streamable_http.py:104/711）——工具等更久没人收，
+    POST 到 300s 就被客户端 ReadTimeout 掐断。上限必须与之对齐。
+    """
+    src = _src()
+    m = re.search(r"^_OCR_WAIT_MAX\s*=\s*(\d+)", src, re.M)
+    assert m, "找不到 _OCR_WAIT_MAX 常量"
+    assert int(m.group(1)) == 300, (
+        f"_OCR_WAIT_MAX={m.group(1)} 与 MCP 客户端 300s read 超时不一致——"
+        "等更久会被客户端凭空掐断，且无法把结果交回去"
+    )
+    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    seg = ast.get_source_segment(src, node)
+    assert "max(0, min(_OCR_WAIT_MAX, int(wait_seconds)))" in seg, (
+        "wait_seconds 必须钳制到 [0, _OCR_WAIT_MAX]"
+    )
+
+
+def test_fingerprint_guard_before_result_reuse():
+    """复用已有结果前必须比对参数指纹（src/pages/dpi）。
+
+    没有指纹门禁，pages="1-5" 之后用 pages="10-20" 续调会读到第一批的
+    产物——语义错误比浪费一次 OCR 严重得多。
+    """
+    src = _src()
+    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    seg = ast.get_source_segment(src, node)
+    assert "fingerprint" in seg, "必须构造参数指纹"
+    assert "prev_fp == fingerprint" in seg, (
+        "复用结果前必须比对指纹相等，否则会返回别的页范围/DPI 的产物"
+    )
+    # 指纹必须含 pages 与 dpi，只含路径不够
+    fp_line = next(
+        (l for l in seg.splitlines() if "fingerprint =" in l and "prev_fp" not in l),
+        "",
+    )
+    assert "pages" in fp_line and "dpi" in fp_line, (
+        f"指纹必须含 pages 与 dpi：{fp_line.strip()}"
+    )
+
+
+def test_wait_loop_has_deadline_exit():
+    """轮询循环必须有 deadline 出口（返回 status=running 让调用方续查）。
+
+    没有出口就是新的同步等——把 653d8515 的 60 分钟原样搬进轮询循环。
+    AST 语义断言（不是字符串存在性）：轮询循环里必须有一个 if，其条件
+    是**裸的**时间比较（不是 `False and x >= deadline` 这种被中和的写法），
+    且体内 return running 态。字符串版锚点曾被"中和判定"变体骗过。
+    """
+    src = _src()
+    tree = ast.parse(src)
+    node = _func_node(tree, "ocr_pdf_to_text")
+    assert node is not None
+
+    guarded = []
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.While):
+            continue
+        for stmt in sub.body:
+            if not isinstance(stmt, ast.If):
+                continue
+            # 条件必须是裸 Compare：BoolOp 包裹意味着可能被常量短路中和
+            if not isinstance(stmt.test, ast.Compare):
+                continue
+            cmp_src = ast.get_source_segment(src, stmt.test) or ""
+            if "deadline" not in cmp_src:
+                continue
+            body_src = ast.get_source_segment(src, stmt) or ""
+            assert '"status": "running"' in body_src, (
+                "deadline 出口必须返回 running 态让调用方续查，否则工具又变成同步等"
+            )
+            guarded.append(cmp_src.strip())
+
+    assert guarded, (
+        "轮询循环里找不到以 deadline 比较为条件的出口——"
+        "工具会无限期等待，重演 653d8515 的挂死形态"
+    )
