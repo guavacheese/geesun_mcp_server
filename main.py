@@ -3,6 +3,7 @@ import os
 import io
 import json
 import re
+import asyncio
 import requests
 from fastmcp import FastMCP
 from dotenv import load_dotenv
@@ -131,30 +132,32 @@ async def copy_script_to_sandbox(
             f"已搜索: {', '.join(source_dirs)}",
         }
 
-    with open(found_path, "rb") as f:
-        content = f.read()
+    # ── 同步段全部下沉 asyncio.to_thread ──
+    # 2026-10-19 事故 653d8515：`async def` 工具里直接跑同步 e2b 调用
+    # （connect/files.write/commands.run）会把 MCP 单事件循环堵满整个命令时长
+    # ——OCR 预算封顶 3600s，客户端 SSE 300s 读超时必死，重连请求在队列里
+    # 干等 55 分钟。e2b SDK 无 async 客户端，唯一解法是把同步段移出循环。
+    # 参照 deer-flow `sandbox/tools.py` 的 `_run_sync_tool_after_async_sandbox_init`。
+    def _sync() -> dict:
+        with open(found_path, "rb") as f:
+            content = f.read()
 
-    # E2B API 连接配置
-    os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
-    os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY", ""))
-    ssl_cert = os.environ.get("SSL_CERT_FILE")
-    if ssl_cert:
-        os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
+        # connect 必须在 try 内：E2B 控制面不可达/沙箱已销毁时 connect 抛异常
+        # （e2b 解析 404 响应可能 KeyError: 'code'），不能让它冒泡成工具级 ToolException
+        try:
+            sb = E2BSandbox.connect(sandbox_id)
+            sb.files.write(sandbox_path, content)
+        except Exception as e:
+            return {
+                "success": False,
+                "sandbox_path": sandbox_path,
+                "size": 0,
+                "error": str(e),
+            }
 
-    # connect 必须在 try 内：E2B 控制面不可达/沙箱已销毁时 connect 抛异常
-    # （e2b 解析 404 响应可能 KeyError: 'code'），不能让它冒泡成工具级 ToolException
-    try:
-        sb = E2BSandbox.connect(sandbox_id)
-        sb.files.write(sandbox_path, content)
-    except Exception as e:
-        return {
-            "success": False,
-            "sandbox_path": sandbox_path,
-            "size": 0,
-            "error": str(e),
-        }
+        return {"success": True, "sandbox_path": sandbox_path, "size": len(content)}
 
-    return {"success": True, "sandbox_path": sandbox_path, "size": len(content)}
+    return await asyncio.to_thread(_sync)
 
 
 @mcp.tool()
@@ -219,9 +222,13 @@ async def upload_to_sandbox(
         )
         return await decrypt_and_upload_to_sandbox(file_path, remote_path, sandbox_id)
 
-    try:
+    # ── 同步段下沉 asyncio.to_thread（2026-10-19 653d8515 事故，详见 copy_script_to_sandbox 注释）──
+    def _read_content() -> bytes:
         with open(file_path, "rb") as f:
-            content = f.read()
+            return f.read()
+
+    try:
+        content = await asyncio.to_thread(_read_content)
     except Exception as e:
         return {
             "success": False,
@@ -233,35 +240,31 @@ async def upload_to_sandbox(
             "size": 0,
         }
 
-    # E2B API 连接配置
-    os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
-    os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY", ""))
-    ssl_cert = os.environ.get("SSL_CERT_FILE")
-    if ssl_cert:
-        os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
-
     # connect 必须在 try 内：E2B 控制面不可达/沙箱已销毁时 connect 抛异常
     # （e2b 解析 404 响应可能 KeyError: 'code'），不能让它冒泡成工具级 ToolException
-    try:
-        sb = E2BSandbox.connect(sandbox_id)
-        sb.files.write(remote_path, content)
-        return {
-            "success": True,
-            "error_code": None,
-            "sandbox_path": remote_path,
-            "size": len(content),
-            "error": None,
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error_code": "sandbox_write_failed",
-            "error": f"连接/写入沙箱 {sandbox_id} 失败: {e}",
-            "virtual_path": original_path,
-            "physical_path": file_path,
-            "sandbox_path": None,
-            "size": 0,
-        }
+    def _sync_upload() -> dict:
+        try:
+            sb = E2BSandbox.connect(sandbox_id)
+            sb.files.write(remote_path, content)
+            return {
+                "success": True,
+                "error_code": None,
+                "sandbox_path": remote_path,
+                "size": len(content),
+                "error": None,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error_code": "sandbox_write_failed",
+                "error": f"连接/写入沙箱 {sandbox_id} 失败: {e}",
+                "virtual_path": original_path,
+                "physical_path": file_path,
+                "sandbox_path": None,
+                "size": 0,
+            }
+
+    return await asyncio.to_thread(_sync_upload)
 
 
 @mcp.tool()
@@ -317,35 +320,32 @@ async def decrypt_and_upload_to_sandbox(
             "size": 0,
         }
 
-    # E2B API 配置已通过 load_dotenv() 从 .env 加载到 os.environ
-    os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
-    os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY", ""))
-    ssl_cert = os.environ.get("SSL_CERT_FILE")
-    if ssl_cert:
-        os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
-
+    # ── 同步段下沉 asyncio.to_thread（2026-10-19 653d8515 事故，详见 copy_script_to_sandbox 注释）──
     # connect 必须在 try 内：E2B 控制面不可达/沙箱已销毁时 connect 抛异常
     # （e2b 解析 404 响应可能 KeyError: 'code'），不能让它冒泡成工具级 ToolException
-    try:
-        sb = E2BSandbox.connect(sandbox_id)
-        sb.files.write(remote_path, result["data"])
-        return {
-            "success": True,
-            "error_code": None,
-            "sandbox_path": remote_path,
-            "size": len(result["data"]),
-            "error": None,
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error_code": "sandbox_write_failed",
-            "error": f"连接/写入沙箱 {sandbox_id} 失败: {e}",
-            "virtual_path": original_path,
-            "physical_path": file_path,
-            "sandbox_path": None,
-            "size": 0,
-        }
+    def _sync_upload() -> dict:
+        try:
+            sb = E2BSandbox.connect(sandbox_id)
+            sb.files.write(remote_path, result["data"])
+            return {
+                "success": True,
+                "error_code": None,
+                "sandbox_path": remote_path,
+                "size": len(result["data"]),
+                "error": None,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error_code": "sandbox_write_failed",
+                "error": f"连接/写入沙箱 {sandbox_id} 失败: {e}",
+                "virtual_path": original_path,
+                "physical_path": file_path,
+                "sandbox_path": None,
+                "size": 0,
+            }
+
+    return await asyncio.to_thread(_sync_upload)
     # ☝️ 注意：不调 sb.kill()，沙箱由 Agent 管理
     #    connect 创建的对象会在函数返回后被 Python GC 回收
     #    对 Agent 的沙箱无影响，文件已成功写入
@@ -366,9 +366,13 @@ async def _decrypt_file_internal(file_path: str) -> dict:
     改流式需连同沙箱写入一起改，已列入 Stage 2 spike。
     """
     try:
-        # 读取原始加密文件
-        with open(file_path, "rb") as f:
-            file_content = f.read()
+        # 同步段下沉 asyncio.to_thread（2026-10-19 653d8515 事故：256MiB 文件的
+        # 同步 read 会把事件循环堵死数秒，长任务场景下与 connect/commands.run 同罪）
+        def _read_all() -> bytes:
+            with open(file_path, "rb") as f:
+                return f.read()
+
+        file_content = await asyncio.to_thread(_read_all)
     except OSError as e:
         return {
             "success": False,
@@ -540,31 +544,35 @@ async def download_from_sandbox(
             "error": f"sandbox_id 无效或为空: '{sandbox_id}'，且宿主机文件不存在: {host_path}",
         }
 
-    # E2B API 连接配置
-    os.environ.setdefault("E2B_API_URL", os.environ.get("E2B_API_URL", ""))
-    os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY", ""))
-    ssl_cert = os.environ.get("SSL_CERT_FILE")
-    if ssl_cert:
-        os.environ.setdefault("SSL_CERT_FILE", ssl_cert)
-
+    # ── 同步段下沉 asyncio.to_thread（2026-10-19 653d8515 事故，详见 copy_script_to_sandbox 注释）──
     # connect 必须在 try 内：E2B 控制面不可达/沙箱已销毁时 connect 抛异常
     # （e2b 解析 404 响应可能 KeyError: 'code'），不能让它冒泡成工具级 ToolException
-    try:
-        sb = E2BSandbox.connect(sandbox_id)
-        content = sb.files.read(sandbox_path, format="bytes")
-    except Exception as e:
-        return {
-            "success": False,
-            "host_path": None,
-            "size": 0,
-            "error": f"读取沙箱文件失败: {str(e)}",
-        }
+    def _sync_read() -> dict:
+        try:
+            sb = E2BSandbox.connect(sandbox_id)
+            content = sb.files.read(sandbox_path, format="bytes")
+        except Exception as e:
+            return {
+                "success": False,
+                "host_path": None,
+                "size": 0,
+                "error": f"读取沙箱文件失败: {str(e)}",
+            }
+        return {"success": True, "content": content}
 
-    # 写宿主机
-    try:
+    r = await asyncio.to_thread(_sync_read)
+    if not r["success"]:
+        return {"success": False, "host_path": None, "size": 0, "error": r["error"]}
+    content = r["content"]
+
+    # 写宿主机同样下沉（大文件写盘 + makedirs 也是同步 IO）
+    def _write_host() -> None:
         os.makedirs(os.path.dirname(host_path), exist_ok=True)
         with open(host_path, "wb") as f:
             f.write(content)
+
+    try:
+        await asyncio.to_thread(_write_host)
     except Exception as e:
         return {
             "success": False,
@@ -775,49 +783,69 @@ def _upload_precheck(physical_path: str, virtual_path: str) -> dict | None:
 
 
 async def _sandbox_write(sandbox_id: str, path: str, content: bytes) -> dict:
-    """写文件到沙箱。"""
+    """写文件到沙箱。
+
+    同步段（connect + files.write）下沉 asyncio.to_thread —— 2026-10-19 653d8515
+    事故的直接根因：async def 里直跑同步 e2b 会把 MCP 单事件循环堵满整个命令时长。
+    """
     _e2b_env()
-    try:
-        sb = E2BSandbox.connect(sandbox_id)
-        sb.files.write(path, content)
-        return {"success": True, "error": None}
-    except Exception as e:
-        return {"success": False, "error": f"写沙箱文件失败: {str(e)}"}
+
+    def _sync() -> dict:
+        try:
+            sb = E2BSandbox.connect(sandbox_id)
+            sb.files.write(path, content)
+            return {"success": True, "error": None}
+        except Exception as e:
+            return {"success": False, "error": f"写沙箱文件失败: {str(e)}"}
+
+    return await asyncio.to_thread(_sync)
 
 
 async def _sandbox_run(sandbox_id: str, cmd: str, timeout: int = 300) -> dict:
-    """沙箱内执行命令（commands.run 返回结构 getattr 容错，兼容不同 SDK 版本）。"""
+    """沙箱内执行命令（commands.run 返回结构 getattr 容错，兼容不同 SDK 版本）。
+
+    同步段（connect + commands.run）下沉 asyncio.to_thread —— 2026-10-19 653d8515
+    事故的直接根因，详见 _sandbox_write 注释。
+    """
     _e2b_env()
-    try:
-        sb = E2BSandbox.connect(sandbox_id)
-        res = sb.commands.run(cmd, timeout=timeout)
-        exit_code = getattr(res, "exit_code", None)
-        stdout = getattr(res, "stdout", None)
-        stderr = getattr(res, "stderr", None)
-        if exit_code is None:
-            # 部分 SDK 版本无 exit_code，用 error 字段
-            error = getattr(res, "error", None)
-            success = not error
-        else:
-            success = exit_code == 0
-        return {
-            "success": success,
-            "stdout": str(stdout or ""),
-            "stderr": str(stderr or ""),
-        }
-    except Exception as e:
-        return {"success": False, "stdout": "", "stderr": str(e)}
+
+    def _sync() -> dict:
+        try:
+            sb = E2BSandbox.connect(sandbox_id)
+            res = sb.commands.run(cmd, timeout=timeout)
+            exit_code = getattr(res, "exit_code", None)
+            stdout = getattr(res, "stdout", None)
+            stderr = getattr(res, "stderr", None)
+            if exit_code is None:
+                # 部分 SDK 版本无 exit_code，用 error 字段
+                error = getattr(res, "error", None)
+                success = not error
+            else:
+                success = exit_code == 0
+            return {
+                "success": success,
+                "stdout": str(stdout or ""),
+                "stderr": str(stderr or ""),
+            }
+        except Exception as e:
+            return {"success": False, "stdout": "", "stderr": str(e)}
+
+    return await asyncio.to_thread(_sync)
 
 
 async def _sandbox_read(sandbox_id: str, path: str) -> dict:
-    """读沙箱文件（bytes）。"""
+    """读沙箱文件（bytes）。同步段下沉 asyncio.to_thread，同 _sandbox_write。"""
     _e2b_env()
-    try:
-        sb = E2BSandbox.connect(sandbox_id)
-        content = sb.files.read(path, format="bytes")
-        return {"success": True, "data": content, "error": None}
-    except Exception as e:
-        return {"success": False, "data": None, "error": f"读沙箱文件失败: {str(e)}"}
+
+    def _sync() -> dict:
+        try:
+            sb = E2BSandbox.connect(sandbox_id)
+            content = sb.files.read(path, format="bytes")
+            return {"success": True, "data": content, "error": None}
+        except Exception as e:
+            return {"success": False, "data": None, "error": f"读沙箱文件失败: {str(e)}"}
+
+    return await asyncio.to_thread(_sync)
 
 
 def _fail(step: str, error: str) -> dict:
