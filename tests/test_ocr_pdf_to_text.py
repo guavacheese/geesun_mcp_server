@@ -125,10 +125,25 @@ def test_no_direct_ocr_library_import_in_tool():
 
 
 def test_entry_and_workdir_constants_present():
+    """执行入口 = **MCP 下发到工作目录的副本**；镜像内那份只作模板锚点。
+
+    2026-10-20 改造：入口从 `/opt/ocr/ocr_run.py`（镜像烘焙）改为
+    `/home/user/_ocr/ocr_run.py`（每次启动任务前由 MCP 下发）。理由：
+      1) 「加一行逐页进度」不值得重建 OCR 镜像（要 ctl 建模板 + 过
+         artifact digest 缓存，慢且易踩坑）；
+      2) 两处独立演进必然漂移，漂移表现就是「OCR 在跑但 pages_ocred 恒 0」。
+    镜像内路径必须单独命名（_OCR_IMAGE_ENTRY），S2 预检用它判断
+    「这是不是一个 OCR 模板」，不得再当执行入口。
+    """
     src = _src()
-    assert re.search(r'^_OCR_ENTRY\s*=\s*"/opt/ocr/ocr_run\.py"', src, re.M), \
-        "_OCR_ENTRY 必须指向 /opt/ocr/ocr_run.py（镜像内唯一封装）"
-    assert re.search(r"^_OCR_WORKDIR\s*=\s*", src, re.M)
+    assert re.search(r'^_OCR_WORKDIR\s*=\s*"/home/user/_ocr"', src, re.M)
+    assert re.search(
+        r'^_OCR_ENTRY\s*=\s*"%s/ocr_run\.py"\s*%\s*_OCR_WORKDIR', src, re.M
+    ), "_OCR_ENTRY 必须指向下发副本（'%s/ocr_run.py' % _OCR_WORKDIR）"
+    assert re.search(
+        r'^_OCR_IMAGE_ENTRY\s*=\s*"/opt/ocr/ocr_run\.py"', src, re.M
+    ), "镜像内路径必须单独命名（_OCR_IMAGE_ENTRY），只作 S2 预检锚点"
+    assert re.search(r"^_OCR_RUNNER_LOCAL\s*=", src, re.M), "缺少本地 payload 路径"
 
 
 def test_precheck_echoes_ok():
@@ -362,13 +377,19 @@ def test_wait_loop_has_deadline_exit():
 # ────────── 陈旧 done.flag / 指纹错配回归（2026-10-19 e2e T4 实锤）──────────
 
 
+async def _stub_ensure_runner(sandbox_id):
+    """默认桩：「下发已成功」。把下发动作与 OCR 状态机解耦——
+    真实下发的字节级验证见 test_ensure_ocr_runner_writes_repo_payload。"""
+    return {"success": True, "version": "1.2.0-test", "error": None}
+
+
 def _load_ocr_module():
     """把 ocr_pdf_to_text 及其依赖（_ocr_collect/_fail/_parse_page_spec/常量）
     摘进同一命名空间，返回可 await 调用的真函数——不 import main（重依赖）。"""
     src = _src()
     tree = ast.parse(src)
     want_names = {"ocr_pdf_to_text", "_ocr_collect", "_fail", "_parse_page_spec",
-                  "_first_json_value"}
+                  "_first_json_value", "_parse_ocr_progress"}
     body = [n for n in tree.body
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in want_names]
     assert len(body) == len(want_names), "依赖函数不全：%s" % [n.name for n in body]
@@ -390,6 +411,14 @@ def _load_ocr_module():
                 except (ValueError, SyntaxError):
                     pass  # _OCR_HELPER_PY 等 literal_eval 吃不下就跳过
     ns = {"json": json, "os": __import__("os"), "re": __import__("re"), **consts}
+    # 派生常量（`"%s/ocr_run.py" % _OCR_WORKDIR` 这类 BinOp，literal_eval 吃不下）
+    # 用与 main.py 相同的表达式补，避免测试常量与生产脱钩。
+    workdir = ns.get("_OCR_WORKDIR", "/home/user/_ocr")
+    ns["_OCR_ENTRY"] = "%s/ocr_run.py" % workdir
+    ns["_OCR_IMAGE_ENTRY"] = "/opt/ocr/ocr_run.py"
+    # 下发动作在单测里用 stub 顶替（真实下发的测试见
+    # test_ocr_runner_shipped_*，那里 mock 掉 _sandbox_write）。
+    ns["_ensure_ocr_runner"] = _stub_ensure_runner
     mod = ast.Module(body=body, type_ignores=[])
     exec(compile(mod, str(MAIN_PY), "exec"), ns)  # noqa: S102
     return ns
@@ -524,3 +553,244 @@ def test_fingerprint_check_precedes_done_flag_branch():
         "指纹读取被挪进了 done.flag 分支——完成信号存在时将永不校验指纹，"
         "重演 T4 收旧产物 IndexError"
     )
+
+
+# ────────── P0/P1（2026-10-20 add0229b）：后台启动无效 + 进度恒 0 ──────────
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+RUNNER_PY = REPO_ROOT / "sandbox" / "ocr_run.py"
+
+
+def test_cleanup_and_launch_are_separate_commands():
+    """清场与启动必须是**两条独立的 commands.run**。
+
+    2026-10-20 add0229b 实锤：合成一条 `A && B && C & echo D` 时 bash 会把
+    整个 and-list 后台化（等价于 `{ A && B && C; } & echo D`）。外层子 shell
+    继承了 commands.run 的 stdout 管道，且要等 C（nohup 前台执行）跑完才
+    退出 ⇒ commands.run 卡满 timeout 抛 TimeoutException，e2b 收会话时把
+    python3 连锅端；而 A/B 里的 rm -f 早已执行成功 ⇒ 旧产物被清空、新产物
+    永不生成。外部表现 = 续查 5 次 / 22 分钟 / pages_ocred 恒 0。
+
+    沙箱 A/B（_bg_ab2_inner.py，真实 OCR 命令）：`&&` 链 25s 卡满被 Timeout
+    杀；拆开后 0.0s 返回 BG_STARTED，python3 存活并在真跑。
+    """
+    src = _src()
+    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "ocr_pdf_to_text")))
+    assert "mkdir -p %s; rm -f %s %s %s" in seg, (
+        "清场命令必须用 `;` 分隔（mkdir ...; rm -f ...）——用 `&&` 会把后续命令"
+        "串成 and-list 一起被后台化，commands.run 卡到超时并杀死 OCR"
+    )
+    launch_lines = [ln for ln in seg.splitlines() if "nohup bash -c" in ln]
+    assert launch_lines, "找不到 nohup 启动命令"
+    for ln in launch_lines:
+        assert "mkdir" not in ln and "rm -f" not in ln, (
+            "启动命令里不得再合并 mkdir/rm —— 那正是 and-list 后台化的来源"
+        )
+
+
+def test_launch_visibility_probe_exists():
+    """必须有「启动可见性」判据：既没 BG_STARTED 也没 err.log 内容 ⇒ 显式失败。
+
+    否则就是 add0229b 的静默：工具连回 5 次 status=running + pages_ocred=0，
+    模型判定卡死 → 换策略解析文本层 → 最终被循环检测硬停。
+    """
+    src = _src()
+    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "ocr_pdf_to_text")))
+    assert "BG_STARTED" in seg
+    assert "_OCR_LAUNCH_PROBE_TRIES" in seg, "缺少启动探针轮次常量"
+    assert 'return _fail(\n                    "launch"' in seg or '"launch",' in seg, \
+        "启动失败必须返回 step=launch 的显式错误"
+    assert "wc -c <" in seg, "探针必须检查 err.log 是否有内容（进程落首行的证据）"
+
+
+class _NoLaunchSandbox:
+    """后台任务从未起来的现场：launch 命令 stdout 空（BG_STARTED 丢失），
+    之后既无 done.flag 也无 err.log 内容——add0229b 的 22 分钟空等起点。"""
+
+    def __init__(self):
+        self.commands: list[str] = []
+
+    async def run(self, sandbox_id, cmd, timeout=None):
+        self.commands.append(cmd)
+        if cmd.startswith("test -f /home/user/_ocr/e2e.pdf"):  # S1 定位校验
+            return {"success": True, "stdout": "OK\n", "stderr": ""}
+        if "grep -m1" in cmd:  # S2 环境预检
+            return {"success": True, "stdout": '__version__ = "1.1.0"\nOK\n', "stderr": ""}
+        if cmd.endswith("_page.py /home/user/_ocr/e2e.pdf"):  # S3 页数探测
+            return {"success": True, "stdout": "5\n", "stderr": ""}
+        if "nohup bash -c" in cmd:  # 启动：BG_STARTED 丢失 + 无 stderr
+            return {"success": True, "stdout": "", "stderr": ""}
+        if "wc -c <" in cmd:  # err.log 大小探针：恒 0
+            return {"success": True, "stdout": "0\n", "stderr": ""}
+        return {"success": True, "stdout": "", "stderr": ""}
+
+    async def write(self, sandbox_id, path, data):
+        return {"success": True, "error": None}
+
+    async def read(self, sandbox_id, path):
+        return {"success": False, "data": b"", "error": "not found"}
+
+
+def test_launch_failure_is_reported_not_silently_running():
+    """启动不起来必须显式失败，不得静默进入 running 让模型空等。"""
+    import asyncio as _asyncio
+
+    ns = _load_ocr_module()
+    sb = _NoLaunchSandbox()
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+    ns["_upload_precheck"] = None
+    ns["_resolve_host_path"] = None
+    ns["_OCR_LAUNCH_PROBE_TRIES"] = 2  # 别让单测真等 10s
+    ns["_OCR_LAUNCH_PROBE_INTERVAL"] = 0
+
+    r = _asyncio.run(ns["ocr_pdf_to_text"](
+        sandbox_id="sbx-test",
+        sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+        pages="all",
+        dpi=150,
+        wait_seconds=1,
+    ))
+    assert r["success"] is False, r
+    assert r["step"] == "launch", "启动失败必须报 step=launch，实际：%s" % r
+    assert "未能启动" in r["error"], r["error"]
+
+
+class _ProgressSandbox:
+    """OCR 真在跑的现场：BG_STARTED 正常，err.log 里已有逐页进度行。"""
+
+    def __init__(self, err_text: str):
+        self.err_text = err_text
+        self.commands: list[str] = []
+
+    async def run(self, sandbox_id, cmd, timeout=None):
+        self.commands.append(cmd)
+        if cmd.startswith("test -f /home/user/_ocr/e2e.pdf"):  # S1 定位校验
+            return {"success": True, "stdout": "OK\n", "stderr": ""}
+        if "grep -m1" in cmd:
+            return {"success": True, "stdout": '__version__ = "1.1.0"\nOK\n', "stderr": ""}
+        if cmd.endswith("_page.py /home/user/_ocr/e2e.pdf"):
+            return {"success": True, "stdout": "20\n", "stderr": ""}
+        if "nohup bash -c" in cmd:
+            return {"success": True, "stdout": "BG_STARTED\n", "stderr": ""}
+        if cmd.startswith("tail -n"):
+            return {"success": True, "stdout": self.err_text, "stderr": ""}
+        return {"success": True, "stdout": "", "stderr": ""}
+
+    async def write(self, sandbox_id, path, data):
+        return {"success": True, "error": None}
+
+    async def read(self, sandbox_id, path):
+        return {"success": False, "data": b"", "error": "not found"}
+
+
+def test_running_result_carries_sandbox_path_and_real_progress():
+    """running 返回必须带沙箱路径 + 真实进度（不是恒 0）。
+
+    add0229b：模型 `ls /home/user` 没看到 `_ocr/` 子目录 ⇒ 结论"PDF 没上传"
+    ⇒ 重传 268MB。返回值里给 sandbox_path/sandbox_dir、提示里写"不要重新上传"
+    就能避免这类"合理误判"。
+    """
+    import asyncio as _asyncio
+
+    err = "\n".join([
+        "[ocr_run] env MemTotal=7952MB dpi=150 det_limit=1500 mkldnn=False",
+        "[ocr_run] render start file=e2e.pdf total=20 dpi=150",
+        "[ocr_run] render 20/20",
+        "[ocr_run] ocr start pages=20",
+        "[ocr_run] page 7/20 ok texts=48 elapsed=31.2s",
+    ])
+    ns = _load_ocr_module()
+    sb = _ProgressSandbox(err)
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+    ns["_upload_precheck"] = None
+    ns["_resolve_host_path"] = None
+
+    r = _asyncio.run(ns["ocr_pdf_to_text"](
+        sandbox_id="sbx-test",
+        sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+        pages="all",
+        dpi=150,
+        wait_seconds=0,  # 立即进 running 分支
+    ))
+    assert r["status"] == "running", r
+    assert r["pages_ocred"] == 7, "进度必须来自 err.log 逐页行，实际：%s" % r["pages_ocred"]
+    assert r["pages_ocred_total"] == 20, r
+    assert r["sandbox_path"] == "/home/user/_ocr/e2e.pdf", r
+    assert r["sandbox_dir"] == "/home/user/_ocr", r
+    assert "正在逐页 OCR" in r["progress_hint"], r["progress_hint"]
+    assert "不要重新上传" in r["progress_hint"], r["progress_hint"]
+
+
+def test_parse_ocr_progress_reads_page_lines():
+    """进度解析：取最后一行的 i/n；渲染阶段不计入页进度。"""
+    ns = _load_ocr_module()
+    parse = ns["_parse_ocr_progress"]
+    err = "\n".join([
+        "[ocr_run] env MemTotal=7952MB dpi=150 det_limit=1500 mkldnn=False",
+        "[ocr_run] render start file=x.pdf total=262 dpi=150",
+        "[ocr_run] render 10/262",
+        "[ocr_run] render 262/262",
+        "[ocr_run] ocr start pages=262",
+        "[ocr_run] page 1/262 ok texts=48 elapsed=31.2s",
+        "[ocr_run] page 2/262 ok texts=0 elapsed=29.8s",
+    ])
+    assert parse(err) == (2, 262), parse(err)
+    # 只有渲染进度 ⇒ 页进度仍 0（total 未知），4b 据此显示"正在渲染"
+    assert parse("[ocr_run] render 30/262") == (0, None)
+    assert parse("") == (0, None)
+
+
+def test_progress_mark_matches_sandbox_script():
+    """MCP 的进度标记必须与沙箱脚本实际打印的前缀一致（双端契约）。
+
+    两边分别是 main.py::_OCR_PROGRESS_MARK 与 sandbox/ocr_run.py 的
+    PROGRESS_PREFIX + "page i/n"。改任何一边而忘另一边 ⇒ pages_ocred 恒 0
+    且**不报错**——这类静默退化只能靠契约测试锁住。
+    """
+    ns = _load_ocr_module()
+    mark = ns["_OCR_PROGRESS_MARK"]
+    payload = RUNNER_PY.read_text("utf-8")
+    m = re.search(r'^PROGRESS_PREFIX\s*=\s*"([^"]*)"', payload, re.M)
+    assert m, "sandbox/ocr_run.py 里找不到 PROGRESS_PREFIX"
+    prefix = m.group(1)
+    assert mark == prefix + "page ", (
+        "MCP 标记 %r 与脚本前缀 %r 不匹配（脚本打的是 '%spage i/n'）"
+        % (mark, prefix, prefix)
+    )
+    assert '"page %d/%d %s texts=%d elapsed=%.1fs"' in payload, "逐页进度行格式变了"
+    assert re.search(r'__version__\s*=\s*"(\d+)\.(\d+)\.(\d+)"', payload), "缺少版本号"
+
+
+def test_ensure_ocr_runner_writes_repo_payload():
+    """下发内容必须与仓库 sandbox/ocr_run.py **逐字节一致**，且版本可回显。"""
+    import asyncio as _asyncio
+
+    src = _src()
+    node = _func_node(ast.parse(src), "_ensure_ocr_runner")
+    assert node is not None, "_ensure_ocr_runner 未定义"
+    node.decorator_list = []
+    ns = {
+        "_OCR_ENTRY": "/home/user/_ocr/ocr_run.py",
+        "_OCR_RUNNER_LOCAL": RUNNER_PY,
+        "logger": types.SimpleNamespace(info=lambda *a, **k: None),
+    }
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(MAIN_PY), "exec"), ns)  # noqa: S102
+    captured = {}
+
+    async def _write(sid, path, data):
+        captured["path"] = path
+        captured["data"] = data
+        return {"success": True, "error": None}
+
+    ns["_sandbox_write"] = _write
+    r = _asyncio.run(ns["_ensure_ocr_runner"]("sbx"))
+    assert r["success"] is True, r
+    assert r["version"].startswith("1.2"), "下发版本应 >= 1.2.0（带逐页进度），实际 %r" % r["version"]
+    assert captured["path"] == "/home/user/_ocr/ocr_run.py"
+    assert captured["data"] == RUNNER_PY.read_bytes(), "下发字节与仓库文件不一致"

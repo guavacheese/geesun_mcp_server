@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from typing import Optional
 import httpx
 import logging
+from pathlib import Path
 from e2b_code_interpreter import Sandbox as E2BSandbox
 
 load_dotenv()
@@ -1131,8 +1132,20 @@ async def run_pdf_diff_stage3(
 #   沙箱内复用 /opt/ocr/ocr_run.py（v1.1.0：enable_mkldnn=False + det 边长 1500 +
 #   dpi 保护 + 逐页容错）。本工具不改它，只负责搬运、分页与收口。
 
-_OCR_ENTRY = "/opt/ocr/ocr_run.py"
 _OCR_WORKDIR = "/home/user/_ocr"
+#: 沙箱侧 OCR 入口。**由 MCP 启动任务前下发**（内容来自仓库
+#: sandbox/ocr_run.py，随镜像 COPY 进 /app/sandbox/），不再依赖镜像里烘焙的
+#: /opt/ocr/ocr_run.py：
+#:   · 进度行、det 限幅这类能力随 MCP 版本走，改它不必重建 OCR 镜像
+#:     （重建镜像要建模板，且踩过 artifact 按 digest 缓存的坑，成本极高）；
+#:   · 单一来源，避免"镜像里 1.1.0 / MCP 期望 1.2.0"的静默漂移
+#:     （漂移的后果正是"跑了但看不到进度"）。
+#: 镜像内的 /opt/ocr/ocr_run.py 仍保留，供交互式排障用，不是生产路径。
+_OCR_ENTRY = "%s/ocr_run.py" % _OCR_WORKDIR
+_OCR_RUNNER_LOCAL = Path(__file__).with_name("sandbox") / "ocr_run.py"
+#: 镜像内烘焙的封装。**只用作"这是不是 OCR 模板"的环境锚点**（S2 预检），
+#: 不是执行入口——执行入口是上面那个由 MCP 下发的副本。
+_OCR_IMAGE_ENTRY = "/opt/ocr/ocr_run.py"
 _OCR_PREVIEW_CHARS = 2000
 _OCR_DPI_MIN, _OCR_DPI_MAX = 100, 200
 #: 轮询间隔（秒）。事件循环已自由（同步段全在 to_thread），5s 粒度对
@@ -1144,6 +1157,17 @@ _OCR_POLL_INTERVAL = 5
 #: （streamable_http.py:104/711）——工具等更久也不会有人收，POST 到
 #: 300s 就被客户端 ReadTimeout 掐断。故 300 是"等到被掐"之前的极限。
 _OCR_WAIT_MAX = 300
+#: 后台任务启动可见性探针（2026-10-20 add0229b）。commands.run 未返回
+#: BG_STARTED 时给进程这么久落首个 stderr 行：ocr_run.py 启动即打 env 行，
+#: 真起来了 1~2s 就有内容；这么久还空 ⇒ 进程根本没起来，立刻显式失败。
+#: 不能让模型对着一个不存在的任务续查 5 次、等 22 分钟（事故原样）。
+_OCR_LAUNCH_PROBE_TRIES = 10
+_OCR_LAUNCH_PROBE_INTERVAL = 1
+#: 进度标记：ocr_run.py 每页往 stderr 打一行 `[ocr_run] page i/n ...`。
+#: pages_ocred 从这里解析——result.json 只在整批跑完才落地，轮询期间
+#: 拿它统计只会恒 0（add0229b：模型看 22 分钟"0 页"判定卡死，转去解析
+#: 文本层，最终被硬停）。进度必须来自增量信号。
+_OCR_PROGRESS_MARK = "[ocr_run] page "
 
 # 沙箱内的小工具：报页数 / 按页下标拆子 PDF。单独成文件，避免把路径拼进
 # `python3 -c` 的引号里（路径含空格/中文/引号时会碎）。
@@ -1161,6 +1185,73 @@ if len(sys.argv) > 2:
     out.save(src + ".sub.pdf")
 print(doc.page_count)
 '''
+
+
+def _parse_ocr_progress(err_text: str) -> tuple[int, int | None]:
+    """从 err.log 解析沙箱侧 OCR 进度：(已完成页数, 本次任务总页数|None)。
+
+    ocr_run.py 每页往 stderr 打一行
+        `[ocr_run] page <i>/<n> ok texts=<k> elapsed=<s>s`
+    取最后一行的 i/n。没有进度行时返回 (0, None)——此时要么还在渲染
+    （PDF→PNG 是整批做的，渲染完才开始逐页），要么进程没起来。调用方
+    配合 err.log 是否有内容来区分这两种情况。
+
+    ★ 为什么不用 result.json 统计：它只在整批跑完才一次性落地，轮询期间
+      永远是旧文件或不存在 ⇒ pages_ocred 恒 0（add0229b 模型据此判定
+      "22 分钟零进展"，转而重复上传 + 解析文本层，最终被硬停）。
+    """
+    done = 0
+    total: int | None = None
+    for line in (err_text or "").splitlines():
+        if _OCR_PROGRESS_MARK not in line:
+            continue
+        seg = line.split(_OCR_PROGRESS_MARK, 1)[1].strip()
+        head, _, rest = seg.partition("/")
+        try:
+            done = int(head.strip())
+        except ValueError:
+            continue
+        if rest:
+            try:
+                total = int(rest.split()[0].strip())
+            except (ValueError, IndexError):
+                pass
+    return done, total
+
+
+async def _ensure_ocr_runner(sandbox_id: str) -> dict:
+    """把仓库内的 sandbox/ocr_run.py 下发到沙箱工作目录（幂等覆盖）。
+
+    返回 ``{"success": bool, "version": str, "error": str|None}``。
+
+    为什么下发而不是用镜像里那份：
+      · OCR 镜像重建要过 ctl 建模板 + artifact 缓存，慢且易踩 digest 坑；
+        而"加一行进度输出"这种改动不值得动镜像。
+      · 版本随之固定：镜像那份是 1.1.0（无进度行），MCP 期望 1.2.0（有），
+        两处独立演进必然漂移 —— 漂移时的表现就是"OCR 在跑但 pages_ocred
+        恒 0"，排查成本极高。
+
+    版本号从脚本 `__version__` 行解析，写进日志与返回值，便于事后核实
+    沙箱里实际执行的是哪一版。
+    """
+    try:
+        payload = _OCR_RUNNER_LOCAL.read_bytes()
+    except OSError as e:
+        return {
+            "success": False,
+            "version": "",
+            "error": "读取本地 %s 失败: %s" % (_OCR_RUNNER_LOCAL.name, e),
+        }
+    version = ""
+    for line in payload.decode("utf-8", errors="replace").splitlines():
+        if line.startswith("__version__"):
+            version = line.split("=", 1)[1].strip().strip("\"'")
+            break
+    wr = await _sandbox_write(sandbox_id, _OCR_ENTRY, payload)
+    if not wr.get("success"):
+        return {"success": False, "version": version, "error": wr.get("error")}
+    logger.info("[OCR] 下发 ocr_run.py v%s → %s (%d bytes)", version, _OCR_ENTRY, len(payload))
+    return {"success": True, "version": version, "error": None}
 
 
 def _parse_page_spec(spec: str, page_count: int) -> tuple[list[int] | None, str | None]:
@@ -1363,13 +1454,14 @@ async def ocr_pdf_to_text(
     env = await _sandbox_run(
         sandbox_id,
         "test -f %s && grep -m1 '^__version__' %s && echo OK"
-        % (_OCR_ENTRY, _OCR_ENTRY),
+        % (_OCR_IMAGE_ENTRY, _OCR_IMAGE_ENTRY),
         timeout=60,
     )
     if "OK" not in (env.get("stdout") or ""):
         return _fail(
             "precheck",
-            f"沙箱内缺少 {_OCR_ENTRY}（模板过旧）。请在 ocr-20g-v4 及以上模板重建沙箱后再试。",
+            f"沙箱内缺少 {_OCR_IMAGE_ENTRY}（不是 OCR 模板）。"
+            "请在 ocr-20g-v5 及以上模板重建沙箱后再试。",
         )
 
     # ── S3：页数 + 可选拆分 ──
@@ -1467,7 +1559,7 @@ async def ocr_pdf_to_text(
             warnings0: list[str] = ["复用沙箱内已有 OCR 结果（参数指纹一致，未重跑）"]
             return await _ocr_collect(
                 sandbox_id, out_json, out_err, page_count, want, pages, dpi,
-                t0, warnings0, n_pages,
+                t0, warnings0, n_pages, target_pdf,
             )
         # 启动新的后台任务。启动命令退出码不可全信（e2b process 服务偶发
         # 竞态：同一条命令实测两次一次 exit=1 一次 exit=0），以文件信号为准。
@@ -1476,15 +1568,45 @@ async def ocr_pdf_to_text(
         )
         if not meta_write["success"]:
             return _fail("prepare", meta_write["error"])
-        bg_cmd = (
-            "mkdir -p %s && rm -f %s %s %s && "
-            "nohup bash -c 'python3 %s %s --json --dpi %d > %s 2> %s; echo $? > %s' "
-            "</dev/null >/dev/null 2>&1 & echo BG_STARTED"
+        # ★ 清场与启动必须是两条独立命令（2026-10-20 add0229b 实锤）。
+        #   合成一条 `A && B && C & echo D` 时 bash 把**整个 and-list** 后台化：
+        #   `{ A && B && C; } & echo D`。外层子 shell 继承了 commands.run 的
+        #   stdout 管道，且要等 C（nohup 前台执行）跑完才退出 ⇒ commands.run
+        #   卡满 timeout=60 抛 TimeoutException，e2b 收会话时把 python3 连锅
+        #   端；而 A/B 里的 rm -f 早已执行成功 ⇒ 旧产物被清空、新产物永不生成。
+        #   外部表现 = "续查 5 次、22 分钟、pages_ocred 恒 0"，模型据此判定
+        #   卡死转去解析文本层，最终被循环检测硬停。
+        #   沙箱 A/B 实测（_bg_ab2_inner.py）：同一条 OCR 命令，`&&` 链 25s 卡满
+        #   被杀；拆开后 0.0s 返回 BG_STARTED，python3 存活并在真跑。
+        prep = await _sandbox_run(
+            sandbox_id,
+            "mkdir -p %s; rm -f %s %s %s"
             % (
                 shlex.quote(_OCR_WORKDIR),
                 shlex.quote(out_json),
                 shlex.quote(out_err),
                 shlex.quote(out_done),
+            ),
+            timeout=60,
+        )
+        if not prep.get("success"):
+            return _fail(
+                "prepare",
+                "清理沙箱内旧 OCR 产物失败: %s"
+                % ((prep.get("stderr") or "")[:300] or "commands.run 返回非零"),
+            )
+        # 下发 OCR 入口脚本（幂等覆盖，依赖上一步 mkdir -p）。必须先于启动：
+        # 镜像里烘焙的是 1.1.0（无逐页进度行），而 pages_ocred 真实化与
+        # `[ocr_run] page i/n` 进度行依赖 1.2.0。
+        runner = await _ensure_ocr_runner(sandbox_id)
+        if not runner["success"]:
+            return _fail("prepare", "下发沙箱侧 ocr_run.py 失败: %s" % runner["error"])
+        # 启动命令单独一条：`nohup ... &` 只后台化 nohup 自身，echo 在前台，
+        # shell 立刻退出、管道立刻关闭 ⇒ commands.run 秒级返回。
+        launch_cmd = (
+            "nohup bash -c 'python3 %s %s --json --dpi %d > %s 2> %s; echo $? > %s' "
+            "</dev/null >/dev/null 2>&1 & echo BG_STARTED"
+            % (
                 shlex.quote(_OCR_ENTRY),
                 shlex.quote(target_pdf),
                 int(dpi),
@@ -1493,41 +1615,100 @@ async def ocr_pdf_to_text(
                 shlex.quote(out_done),
             )
         )
-        await _sandbox_run(sandbox_id, bg_cmd, timeout=60)
+        launch = await _sandbox_run(sandbox_id, launch_cmd, timeout=60)
         done_code = await _poll_done()
         # done_code 非 None ⇒ bash -c 秒退（python3 不存在/参数错等），
         # 直接落到下面的退出码分流，不走轮询。
+        # 启动可见性：没看到 BG_STARTED（或 commands.run 自己异常）时**不能
+        # 静默放过**——先给进程一点时间落首个 stderr 行（ocr_run.py 启动即打
+        # env 行），既没 done.flag 也没 err.log 内容 ⇒ 后台任务根本没起来，
+        # 立刻显式失败。add0229b 的 22 分钟空等正是这里静默造成的。
+        if done_code is None and "BG_STARTED" not in (launch.get("stdout") or ""):
+            launch_visible = False
+            for _ in range(_OCR_LAUNCH_PROBE_TRIES):
+                await _asyncio.sleep(_OCR_LAUNCH_PROBE_INTERVAL)
+                done_code = await _poll_done()
+                if done_code is not None:
+                    launch_visible = True  # 秒退：退出码分流能给出真实原因
+                    break
+                err_size = await _sandbox_run(
+                    sandbox_id,
+                    "wc -c < %s 2>/dev/null || echo 0" % shlex.quote(out_err),
+                    timeout=30,
+                )
+                try:
+                    first = (err_size.get("stdout") or "0").strip().split()
+                    if first and int(first[0]) > 0:
+                        launch_visible = True  # 已有 stderr ⇒ 进程真起来了
+                        break
+                except (ValueError, IndexError):
+                    continue
+            if not launch_visible:
+                return _fail(
+                    "launch",
+                    "OCR 后台任务未能启动：commands.run 未返回 BG_STARTED，"
+                    "且 %ds 内 err.log 无任何输出（进程从未起来）。"
+                    "launch_stderr=%r; launch_stdout=%r"
+                    % (
+                        _OCR_LAUNCH_PROBE_TRIES * _OCR_LAUNCH_PROBE_INTERVAL,
+                        (launch.get("stderr") or "")[:300],
+                        (launch.get("stdout") or "")[:200],
+                    ),
+                )
 
     # ── 4b. 轮询等待（单次调用最多 wait_seconds 秒）──
     deadline = _time.time() + wait_seconds
     while done_code is None:
         if _time.time() >= deadline:
+            # 进度来自 err.log 的逐页进度行，不是 result.json（后者整批跑完
+            # 才落地，轮询期间永远读不到 ⇒ 恒 0 ⇒ 模型误判卡死）。
             tail = await _sandbox_run(
-                sandbox_id, "tail -n 2 %s 2>/dev/null" % shlex.quote(out_err), timeout=30
+                sandbox_id, "tail -n 20 %s 2>/dev/null" % shlex.quote(out_err), timeout=30
             )
+            err_tail = (tail.get("stdout") or "").strip()
+            ocred, ocred_total = _parse_ocr_progress(err_tail)
+            if ocred_total is None:
+                ocred_total = n_pages
+            if ocred > 0:
+                stage = "正在逐页 OCR（已处理 %d/%d 页）" % (ocred, ocred_total)
+            elif err_tail:
+                stage = (
+                    "正在渲染 PDF 页面（渲染是整批做的，渲染完才开始逐页 OCR，"
+                    "此阶段进度为 0 属正常）"
+                )
+            else:
+                stage = "尚未产生任何 stderr 输出"
             return {
                 "success": True,
                 "step": None,
                 "error": None,
                 "status": "running",
                 "pages_total": page_count,
-                "pages_ocred": 0,
+                "pages_ocred": ocred,
+                "pages_ocred_total": ocred_total,
                 "pages_failed": 0,
                 "total_texts": 0,
                 "elapsed_sec": round(_time.time() - t0, 1),
                 "payload_json": None,
                 "payload_txt": None,
+                "sandbox_path": target_pdf,
+                "sandbox_dir": _OCR_WORKDIR,
                 "preview": "",
                 "warnings": [],
                 "progress_hint": (
-                    "OCR 仍在沙箱后台运行（本次已等待 %ds）。"
+                    "OCR 仍在沙箱后台运行（本次已等待 %ds；%s）。"
                     "请用完全相同的参数再调一次本工具续查/取结果——"
-                    "参数指纹一致不会重复上传和 OCR。150dpi 实测约 30s/页，"
-                    "本批 %d 页可自行估算剩余时间；err.log 尾部：%s"
+                    "参数指纹一致不会重复上传、也不会重跑 OCR。"
+                    "PDF 在沙箱内 %s（目录 %s），**不要重新上传**。"
+                    "150dpi 实测约 30s/页，本批 %d 页可据此估算剩余时间；"
+                    "err.log 尾部：%s"
                     % (
                         wait_seconds,
+                        stage,
+                        target_pdf,
+                        _OCR_WORKDIR,
                         n_pages,
-                        (tail.get("stdout") or "").strip().replace("\n", " / ")[:200],
+                        err_tail.splitlines()[-1][:200] if err_tail else "(空)",
                     )
                 ),
             }
@@ -1558,7 +1739,7 @@ async def ocr_pdf_to_text(
         )
     return await _ocr_collect(
         sandbox_id, out_json, out_err, page_count, want, pages, dpi,
-        t0, warnings, n_pages,
+        t0, warnings, n_pages, target_pdf,
     )
 
 
@@ -1573,6 +1754,7 @@ async def _ocr_collect(
     t0: float,
     warnings: list[str],
     n_pages: int,
+    sandbox_path: str = "",
 ) -> dict:
     """S5：读回 result.json，拼纯文本，只回摘要 + 预览。
 
@@ -1649,6 +1831,10 @@ async def _ocr_collect(
         "elapsed_sec": round(_time.time() - t0, 1),
         "payload_json": out_json,
         "payload_txt": out_txt,
+        # 沙箱内路径回显：模型据此知道文件在哪、不必重新上传（add0229b：
+        # ls /home/user 没看到 _ocr/ 子目录 ⇒ 结论"PDF 没上传" ⇒ 重传 268MB）。
+        "sandbox_path": sandbox_path,
+        "sandbox_dir": _OCR_WORKDIR,
         "preview": body[:_OCR_PREVIEW_CHARS],
         "warnings": warnings,
     }
