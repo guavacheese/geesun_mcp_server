@@ -1288,3 +1288,33 @@ def test_mcp_logger_is_not_swallowed():
     assert "logging.StreamHandler(sys.stderr)" in src, (
         "handler 必须写 stderr——stdio 传输下 stdout 是协议流，污染即断连"
     )
+
+
+def test_module_level_imports_cover_runtime_deps():
+    """摘出的函数依赖的模块必须在 main.py **模块级**导入过。
+
+    为什么需要这条：`_load_ocr_module` 会把 json/os/re/shlex/logger 注入命名
+    空间，于是"main.py 漏了 import shlex"在单测里完全看不见 —— 1.0.13 就这样
+    把 `name 'shlex' is not defined` 带到了生产，e2e 第一次调用即炸。函数内的
+    局部 `import shlex` 也救不了：`_build_ocr_launch_cmd` 是模块级函数。
+    """
+    tree = ast.parse(_src())
+    imported = set()
+    for n in tree.body:
+        if isinstance(n, ast.Import):
+            imported |= {a.name.split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom):
+            imported |= {a.asname or a.name for a in n.names}
+    for mod in ("json", "os", "re", "shlex"):
+        assert mod in imported, (
+            "main.py 模块级缺少 `import %s`——函数内局部 import 会被 AST 提取器绕过，"
+            "单测照样绿、生产直接 NameError" % mod
+        )
+    assigned = {
+        t.id
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    }
+    assert "logger" in assigned, "main.py 模块级缺少 logger 赋值"
