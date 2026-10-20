@@ -726,6 +726,8 @@ class _ProgressSandbox:
             return {"success": True, "stdout": '__version__ = "1.1.0"\nOK\n', "stderr": ""}
         if cmd.endswith("_page.py /home/user/_ocr/e2e.pdf"):
             return {"success": True, "stdout": "20\n", "stderr": ""}
+        if "SPLIT_OK" in cmd:  # 按页拆分：末尾用 test -s 做真实成功判据
+            return {"success": True, "stdout": "SPLIT_OK\n", "stderr": ""}
         if "nohup bash -c" in cmd:
             return {"success": True, "stdout": "BG_STARTED\n", "stderr": ""}
         if cmd.startswith("tail -n"):
@@ -1484,8 +1486,9 @@ class _BatchSandbox:
         if "mkdir -p" in cmd and "rm -f" in cmd:  # 清场（只清本批目录）
             return {"success": True, "stdout": "", "stderr": ""}
         if "mkdir -p" in cmd and "_page.py" in cmd:  # 拆分本批子 PDF
-            m = re.search(r"_page\.py\s+\S+(.*)$", cmd)
-            picked = len((m.group(1) if m else "").split())
+            # 页号段只到第一个 ';' 为止——后面还有 mv/test -s，不能算进页数
+            m = re.search(r"_page\.py\s+\S+([^;]*)", cmd)
+            picked = len(re.findall(r"\d+", m.group(1) if m else ""))
             if picked:
                 self.pages_by_idx[idx or 0] = picked
             return {"success": True, "stdout": "SPLIT_OK\n", "stderr": ""}
@@ -1686,4 +1689,84 @@ def test_batch_pages_param_is_declared_and_clamped():
     assert "_OCR_BATCH_PAGES_MAX" in src and "min(batch_pages, _OCR_BATCH_PAGES_MAX)" in src, (
         "batch_pages 必须被 _OCR_BATCH_PAGES_MAX 钳制，否则模型传 9999 就把分批退化成"
         "一次性全量（正是本改动要消灭的形态）"
+    )
+
+
+def test_batch_split_moves_subpdf_into_batch_dir():
+    """批模式的子 PDF 必须真的搬进 batches/bNNN/（生产 e2e 实测的缺陷）。
+
+    沙箱侧 `_page.py` 固定把子 PDF 写成 `src + ".sub.pdf"`（helper 的既有约定）。
+    分批时若只把"喂给 ocr_run.py 的路径"改成 batches/bNNN/input.sub.pdf，文件
+    根本不存在 —— 2026-10-20 生产 e2e 三批全部：
+        FileNotFoundError: 输入不存在: /home/user/_ocr/batches/b001/input.sub.pdf
+    而单测当时是绿的：假沙箱对任何含 `_page.py` 的拆分命令都回 SPLIT_OK，
+    **比实现更宽容**。所以这里直接对命令串断言"拆完要搬、搬完要验"。
+
+    ★ 通用教训：凡是"外部工具的输出位置由它的既有约定决定"的步骤，测试都
+      必须断言**目标位置**，不能只断言"命令返回成功"。
+    """
+    _ns, sb, call = _batch_env(page_count=100, batch_pages=40)
+    call()
+    splits = [c for c in sb.commands if "_page.py" in c and "mkdir -p" in c]
+    assert splits, "找不到拆分命令"
+    cmd = splits[0]
+    assert "mv -f" in cmd, "批模式必须在拆分后把子 PDF 搬到批目录：%s" % cmd
+    assert "/batches/b001/input.sub.pdf" in cmd, cmd
+    assert "/home/user/_ocr/e2e.pdf.sub.pdf" in cmd, "mv 的源应是 helper 的既有输出名：%s" % cmd
+    assert "test -s" in cmd and "SPLIT_OK" in cmd, (
+        "拆分成功判据必须是 test -s 目标文件（只看 rc 会把'没搬过去'当成功）：%s" % cmd
+    )
+
+
+def test_single_batch_path_does_not_move_subpdf():
+    """单批路径保持历史行为：子 PDF 留在根目录 e2e.pdf.sub.pdf，不 mv。"""
+    _ns, sb, call = _batch_env(page_count=20, batch_pages=40)
+    call(pages="1-10")  # 显式页范围才需要拆子 PDF（all + 20 页不拆）
+    splits = [c for c in sb.commands if "_page.py" in c and "mkdir -p" in c]
+    assert splits, "显式 pages 应触发拆分"
+    joined = "\n".join(splits)
+    assert "mv -f" not in joined, "单批路径不应引入 mv（改历史行为=引入回归风险）"
+    assert "/home/user/_ocr/e2e.pdf.sub.pdf" in joined, joined
+
+
+class _SplitSilentSandbox(_BatchSandbox):
+    """拆分命令 rc 成功但**目标文件不存在**：模拟"拆出来了但没搬过去"。"""
+
+    async def run(self, sandbox_id, cmd, timeout=None):
+        if "_page.py" in cmd and "mkdir -p" in cmd:
+            self.commands.append(cmd)
+            return {"success": True, "stdout": "", "stderr": ""}  # 没有 SPLIT_OK
+        return await super().run(sandbox_id, cmd, timeout)
+
+
+def test_split_without_target_must_fail_not_silently_ocr():
+    """"拆了但目标不存在"必须显式 _fail("split")，不能带着坏路径去启动 OCR。
+
+    这条正是 e2e 事故的"如果不修会怎样"：旧代码只看 commands.run 的 rc，
+    于是启动了一个指向不存在文件的 OCR 进程，三批各烧 20 秒探针后全失败。
+    """
+    import asyncio as _asyncio
+
+    ns = _load_ocr_module()
+    sb = _SplitSilentSandbox(100, 40)
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+    ns["_upload_precheck"] = None
+    ns["_resolve_host_path"] = None
+
+    r = _asyncio.run(ns["ocr_pdf_to_text"](
+        sandbox_id="sbx-test",
+        sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+        pages="all",
+        dpi=150,
+        wait_seconds=0,
+        batch_pages=40,
+    ))
+    assert r["success"] is False, r
+    assert r["step"] == "split", r
+    assert "input.sub.pdf" in r["error"], r["error"]
+    assert not any("nohup bash -c" in c for c in sb.commands), (
+        "拆分失败后不得启动 OCR 进程（否则白烧一轮探针才报错）"
     )

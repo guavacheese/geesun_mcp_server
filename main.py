@@ -2041,20 +2041,36 @@ async def ocr_pdf_to_text(
 
     target_pdf = src_pdf
     if want is not None:
-        sub = ("%s/input.sub.pdf" % batch_dir) if batching else (src_pdf + ".sub.pdf")
-        sp = await _sandbox_run(
-            sandbox_id,
-            "mkdir -p %s; python3 %s %s %s"
+        # ★ 沙箱侧 _page.py 固定把子 PDF 写在 `src + ".sub.pdf"`（helper 的既有
+        #   约定，不能改——单批路径与历史产物都依赖它）。分批模式必须再「搬」
+        #   到本批目录，否则每批都会指向一个不存在的 input.sub.pdf：
+        #   2026-10-20 e2e 实测正是这样翻车——三批全部
+        #   `FileNotFoundError: 输入不存在: batches/bNNN/input.sub.pdf`，
+        #   因为文件实际叫 `分批复核 CST2026.pdf.sub.pdf` 躺在根目录。
+        #   用 ; 串联而非 &&（`&` 只在末尾才是后台化，这里没有 &，安全），
+        #   末尾用 test -s 做**真实**成功判据：只看 commands.run 的 rc 会把
+        #   "拆出来了但没搬过去"当成功（本次 bug 就是这样躲过启动探针的）。
+        split_src = src_pdf + ".sub.pdf"
+        sub = ("%s/input.sub.pdf" % batch_dir) if batching else split_src
+        parts = [
+            "mkdir -p %s" % shlex.quote(batch_dir or _OCR_WORKDIR),
+            "python3 %s %s %s"
             % (
-                shlex.quote(batch_dir or _OCR_WORKDIR),
                 shlex.quote(helper),
                 shlex.quote(src_pdf),
                 " ".join(str(i) for i in want),
             ),
-            timeout=600,
-        )
-        if not sp.get("success"):
-            return _fail("split", f"按页拆分失败: {(sp.get('stderr') or '')[:300]}")
+        ]
+        if batching:
+            parts.append("mv -f %s %s" % (shlex.quote(split_src), shlex.quote(sub)))
+        parts.append("test -s %s && echo SPLIT_OK" % shlex.quote(sub))
+        sp = await _sandbox_run(sandbox_id, "; ".join(parts), timeout=600)
+        if "SPLIT_OK" not in (sp.get("stdout") or ""):
+            return _fail(
+                "split",
+                "按页拆分失败（%d 页 → %s）: %s"
+                % (len(want), sub, ((sp.get("stderr") or "") or (sp.get("stdout") or ""))[:300]),
+            )
         target_pdf = sub
 
     # ── S4：后台启动 OCR + 轮询等待（submit-and-poll 轻量版）──

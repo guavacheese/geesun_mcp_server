@@ -57,6 +57,12 @@ CASES = [
         "    batch_pages = max(1, batch_pages)",
         "test_batch_pages_param_is_declared_and_clamped",
     ),
+    (
+        "⑥ 拆完不搬子 PDF（生产 e2e 实测缺陷）",
+        "        if batching:\n            parts.append(\"mv -f %s %s\" % (shlex.quote(split_src), shlex.quote(sub)))",
+        "        if False:\n            parts.append(\"mv -f %s %s\" % (shlex.quote(split_src), shlex.quote(sub)))",
+        "test_batch_split_moves_subpdf_into_batch_dir",
+    ),
 ]
 
 fails = 0
