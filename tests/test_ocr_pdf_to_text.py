@@ -284,9 +284,10 @@ def test_background_launch_uses_done_flag_not_pid_liveness():
     assert "kill -0" not in seg, (
         "kill -0 判活已证实不可靠（PID namespace 隔离），改用文件信号"
     )
-    assert "nohup" in seg, "OCR 必须 nohup 后台化，否则 commands.run 会同步等到底"
+    launch = _launch_src()
+    assert "nohup" in launch, "OCR 必须 nohup 后台化，否则 commands.run 会同步等到底"
     # 启动命令必须把 shell 立即返回（& 后台化），否则退化成同步等待
-    assert re.search(r"&\s*echo\s+BG_STARTED", seg), (
+    assert re.search(r"&\s*echo\s+BG_STARTED", launch), (
         "后台启动命令必须以 '& echo BG_STARTED' 收尾，确保秒级返回"
     )
 
@@ -389,7 +390,8 @@ def _load_ocr_module():
     src = _src()
     tree = ast.parse(src)
     want_names = {"ocr_pdf_to_text", "_ocr_collect", "_fail", "_parse_page_spec",
-                  "_first_json_value", "_parse_ocr_progress", "_ocr_task_age_seconds"}
+                  "_first_json_value", "_parse_ocr_progress", "_ocr_task_age_seconds",
+                  "_bump_silent_streak", "_build_ocr_launch_cmd"}
     body = [n for n in tree.body
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in want_names]
     assert len(body) == len(want_names), "依赖函数不全：%s" % [n.name for n in body]
@@ -399,6 +401,18 @@ def _load_ocr_module():
     # _OCR_POLL_INTERVAL/_OCR_HELPER_PY/_OCR_PREVIEW_CHARS）
     consts = {}
     for n in tree.body:
+        if isinstance(n, ast.AnnAssign):
+            # `_OCR_SILENT_STREAK: dict[str, int] = {}` 这类带注解的常量
+            if (
+                isinstance(n.target, ast.Name)
+                and n.target.id.startswith("_OCR_")
+                and n.value is not None
+            ):
+                try:
+                    consts[n.target.id] = ast.literal_eval(n.value)
+                except (ValueError, SyntaxError):
+                    pass
+            continue
         if not isinstance(n, ast.Assign):
             continue
         # 兼容 `A, B = 1, 2` 元组赋值（_OCR_DPI_MIN/_OCR_DPI_MAX）
@@ -411,6 +425,8 @@ def _load_ocr_module():
                 except (ValueError, SyntaxError):
                     pass  # _OCR_HELPER_PY 等 literal_eval 吃不下就跳过
     ns = {"json": json, "os": __import__("os"), "re": __import__("re"),
+          # _build_ocr_launch_cmd 需要 shlex.quote（P0-1 引号修复）
+          "shlex": __import__("shlex"),
           # logger 桩：被测函数只做日志输出，不能因缺名而崩
           "logger": types.SimpleNamespace(
               info=lambda *a, **k: None,
@@ -450,6 +466,10 @@ class _FakeSandbox:
 
     async def run(self, sandbox_id, cmd, timeout=None):
         self.commands.append(cmd)
+        if "LINKED" in cmd or "COPIED" in cmd:  # P0-3 输入路径归一化
+            return {"success": True, "stdout": "LINKED\n", "stderr": ""}
+        if "wc -c <" in cmd:  # P0-2 启动可见性探针：err.log 有 start 行
+            return {"success": True, "stdout": "48\n", "stderr": ""}
         if cmd.startswith("test -f /home/user/_ocr/e2e.pdf"):
             return {"success": True, "stdout": "OK\n", "stderr": ""}
         if "grep -m1" in cmd:  # S2 环境预检
@@ -568,6 +588,14 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 RUNNER_PY = REPO_ROOT / "sandbox" / "ocr_run.py"
 
 
+def _launch_src() -> str:
+    """`_build_ocr_launch_cmd` 的源码（启动命令的唯一构造点）。"""
+    src = _src()
+    return _code_only(
+        ast.get_source_segment(src, _func_node(ast.parse(src), "_build_ocr_launch_cmd"))
+    )
+
+
 def test_cleanup_and_launch_are_separate_commands():
     """清场与启动必须是**两条独立的 commands.run**。
 
@@ -587,12 +615,18 @@ def test_cleanup_and_launch_are_separate_commands():
         "清场命令必须用 `;` 分隔（mkdir ...; rm -f ...）——用 `&&` 会把后续命令"
         "串成 and-list 一起被后台化，commands.run 卡到超时并杀死 OCR"
     )
-    launch_lines = [ln for ln in seg.splitlines() if "nohup bash -c" in ln]
+    launch_lines = [
+        ln for ln in _launch_src().splitlines() if "nohup bash -c" in ln
+    ]
     assert launch_lines, "找不到 nohup 启动命令"
     for ln in launch_lines:
         assert "mkdir" not in ln and "rm -f" not in ln, (
             "启动命令里不得再合并 mkdir/rm —— 那正是 and-list 后台化的来源"
         )
+    # 调用点不得把 mkdir/rm 拼进启动命令
+    call = [ln for ln in seg.splitlines() if "_build_ocr_launch_cmd(" in ln]
+    assert call, "启动命令必须经由 _build_ocr_launch_cmd 构造"
+    assert not any("rm -f" in ln for ln in call), "启动调用点不得携带 rm -f"
 
 
 def test_launch_visibility_probe_exists():
@@ -674,6 +708,10 @@ class _ProgressSandbox:
 
     async def run(self, sandbox_id, cmd, timeout=None):
         self.commands.append(cmd)
+        if "LINKED" in cmd or "COPIED" in cmd:  # P0-3 输入路径归一化
+            return {"success": True, "stdout": "LINKED\n", "stderr": ""}
+        if "wc -c <" in cmd:  # P0-2 启动可见性探针：err.log 有 start 行
+            return {"success": True, "stdout": "48\n", "stderr": ""}
         if cmd.startswith("test -f /home/user/_ocr/e2e.pdf"):  # S1 定位校验
             return {"success": True, "stdout": "OK\n", "stderr": ""}
         if "grep -m1" in cmd:
@@ -818,6 +856,10 @@ class _ResumeSandbox:
 
     async def run(self, sandbox_id, cmd, timeout=None):
         self.commands.append(cmd)
+        if "LINKED" in cmd or "COPIED" in cmd:  # P0-3 输入路径归一化
+            return {"success": True, "stdout": "LINKED\n", "stderr": ""}
+        if "wc -c <" in cmd:  # P0-2 启动可见性探针
+            return {"success": True, "stdout": "48\n", "stderr": ""}
         if cmd.startswith("test -f /home/user/_ocr/e2e.pdf"):
             return {"success": True, "stdout": "OK\n", "stderr": ""}
         if "grep -m1" in cmd:
@@ -988,7 +1030,261 @@ def test_liveness_gate_precedes_restart():
     assert "_ocr_task_age_seconds" in seg, "缺少 mtime 判活探针"
     assert "_OCR_LIVENESS_SEC" in seg, "缺少判活窗口常量"
     i_age = seg.find("_ocr_task_age_seconds")
-    i_launch = seg.find("nohup bash -c")
+    i_launch = seg.find("_build_ocr_launch_cmd(")
     assert i_age != -1 and i_launch != -1 and i_age < i_launch, (
         "判活必须在启动命令之前完成（否则重启已在进行）"
+    )
+
+
+# ────────── P0-1/P0-2/P0-3 + P1（2026-10-20 add0229b 第二轮）──────────
+
+
+def test_launch_cmd_roundtrip_with_special_chars():
+    """启动命令必须对**含空格/中文/引号/$** 的路径安全（P0-1）。
+
+    现场（67 上 A/B）：`nohup bash -c 'python3 <shlex.quote(pdf)> ...'` 里外层
+    手写单引号与 shlex.quote 生成的内层单引号嵌套 ⇒ bash 在第一个内层单引号
+    处截断命令串。实测 argv：
+        无空格 long.pdf       → [ocr_run.py, long.pdf, --json, --dpi, 150]  产物齐全
+        含空格 康视达 CST...pdf → [ocr_run.py, "/home/user/_ocr/康视达"]    产物全无
+    本测试用 shlex.split 做两次往返（外层 shell 切一次、内层 bash -c 再切一次），
+    等价于 bash 的解析结果，锁住"整串 quote"这个修法。
+    """
+    import shlex
+
+    ns = _load_ocr_module()
+    build = ns["_build_ocr_launch_cmd"]
+    entry = "/home/user/_ocr/ocr_run.py"
+    outs = ("/home/user/_ocr/result.json", "/home/user/_ocr/err.log", "/home/user/_ocr/done.flag")
+    for name in (
+        "康视达 CST2026手册.pdf.sub.pdf",   # 空格 + 中文（add0229b 现场）
+        "康视达_CST2026手册.pdf",           # 下划线（84433a68 现场，旧写法侥幸能跑）
+        "a'b.pdf",                          # 单引号
+        "a$USER b.pdf",                     # $ 展开
+        "a\"b c.pdf",                       # 双引号
+    ):
+        pdf = "/home/user/_ocr/" + name
+        cmd = build(entry, pdf, 150, *outs)
+        outer = shlex.split(cmd)
+        assert outer[:2] == ["nohup", "bash"], outer
+        assert "-c" in outer, "必须把整条内层命令作为 bash -c 的单个参数"
+        inner = outer[outer.index("-c") + 1]
+        argv = shlex.split(inner)
+        assert argv[:5] == ["python3", entry, pdf, "--json", "--dpi"], (
+            "路径 %r 未完整还原，实际 argv=%r" % (name, argv[:6])
+        )
+        # 重定向与退出码回写必须还在（旧 bug 里它们全被截断丢弃）
+        # 注：shlex 不把 `;` 当分隔符，故 err.log 后面可能粘着 ';'
+        assert ">" in argv and outs[0] in argv, argv
+        assert "2>" in argv and any(t.rstrip(";") == outs[1] for t in argv), argv
+        assert outs[2] in argv and argv[-1] == outs[2], (
+            "done.flag 回写必须是最后一段，实际：%r" % (argv[-4:],)
+        )
+
+
+def test_legacy_handwired_single_quotes_still_break_spaces():
+    """反向锚点：证明旧写法确实会碎（防止有人把修法回退成手写单引号）。
+
+    这条断言不是在测生产代码，而是把根因钉在测试里——以后再看到
+    `bash -c 'python3 ...'` 这种手写引号，这里会立刻提醒它为什么不行。
+    """
+    import shlex
+
+    entry = "/home/user/_ocr/ocr_run.py"
+    pdf = "/home/user/_ocr/康视达 CST2026手册.pdf.sub.pdf"
+    legacy = (
+        "nohup bash -c 'python3 %s %s --json --dpi 150 > %s 2> %s; echo $? > %s' "
+        "</dev/null >/dev/null 2>&1 & echo BG_STARTED"
+        % (shlex.quote(entry), shlex.quote(pdf),
+           shlex.quote("/home/user/_ocr/result.json"),
+           shlex.quote("/home/user/_ocr/err.log"),
+           shlex.quote("/home/user/_ocr/done.flag"))
+    )
+    inner = shlex.split(legacy)[shlex.split(legacy).index("-c") + 1]
+    argv = shlex.split(inner)
+    assert argv[2] != pdf, "旧写法居然还原对了？那 P0-1 的前提不成立，需重新取证"
+    assert argv[2] == "/home/user/_ocr/康视达", argv
+
+
+class _BgStartedNoErrlogSandbox:
+    """BG_STARTED 有、err.log 永远没有内容的现场（P0-2 的核心回归点）。
+
+    missing=True  → err.log 从未被创建（启动命令没跑到底）
+    missing=False → err.log 已创建但始终 0 字节（python3 没执行)
+    """
+
+    def __init__(self, missing: bool):
+        self.missing = missing
+        self.commands: list[str] = []
+
+    async def run(self, sandbox_id, cmd, timeout=None):
+        self.commands.append(cmd)
+        if "LINKED" in cmd or "COPIED" in cmd:
+            return {"success": True, "stdout": "LINKED\n", "stderr": ""}
+        if cmd.startswith("test -f /home/user/_ocr/e2e.pdf"):
+            return {"success": True, "stdout": "OK\n", "stderr": ""}
+        if "grep -m1" in cmd:
+            return {"success": True, "stdout": '__version__ = "1.2.1"\nOK\n', "stderr": ""}
+        if cmd.endswith("_page.py /home/user/_ocr/e2e.pdf"):
+            return {"success": True, "stdout": "5\n", "stderr": ""}
+        if "nohup bash -c" in cmd:  # 启动命令"成功"，BG_STARTED 照常回
+            return {"success": True, "stdout": "BG_STARTED\n", "stderr": ""}
+        if "wc -c <" in cmd:  # 关键：BG_STARTED 有，但 err.log 始终无内容
+            return {"success": True, "stdout": "MISSING\n" if self.missing else "0\n",
+                    "stderr": ""}
+        if cmd.startswith("cat ") and "done.flag" in cmd:
+            return {"success": True, "stdout": "", "stderr": ""}
+        return {"success": True, "stdout": "", "stderr": ""}
+
+    async def write(self, sandbox_id, path, data):
+        return {"success": True, "error": None}
+
+    async def read(self, sandbox_id, path):
+        return {"success": False, "data": b"", "error": "not found"}
+
+
+def _run_launch_probe(sb, tries=2):
+    import asyncio as _asyncio
+
+    ns = _load_ocr_module()
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+    ns["_upload_precheck"] = None
+    ns["_resolve_host_path"] = None
+    ns["_OCR_LAUNCH_PROBE_TRIES"] = tries
+    ns["_OCR_LAUNCH_PROBE_INTERVAL"] = 0
+    return _asyncio.run(ns["ocr_pdf_to_text"](
+        sandbox_id="sbx-test",
+        sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+        pages="all",
+        dpi=150,
+        wait_seconds=1,
+    ))
+
+
+def test_launch_probe_not_short_circuited_by_bg_started():
+    """BG_STARTED 不能短路启动验证（P0-2，add0229b 二轮的直接死因）。
+
+    旧代码 `if done is None and "BG_STARTED" not in stdout:` 才做探针 ——
+    引号截断事故里 BG_STARTED 照常输出（echo 在截断之前），于是探针被跳过，
+    工具连续 11 次回 running/pages_ocred=0，模型空等 22 分钟。
+    """
+    sb = _BgStartedNoErrlogSandbox(missing=True)
+    r = _run_launch_probe(sb)
+    assert r["success"] is False, r
+    assert r["step"] == "launch", r
+    assert "未能启动" in r["error"], r["error"]
+    assert "始终未被创建" in r["error"], "必须指出 err.log 根本没被创建：%s" % r["error"]
+    assert "BG_STARTED=收到" in r["error"], (
+        "必须点明 BG_STARTED 已收到但仍失败（否则排查会再次误判成'启动成功'）"
+    )
+
+
+def test_launch_probe_flags_empty_errlog_separately():
+    """err.log 存在但为空 ⇒ 文案必须与"不存在"区分（两种故障修法不同）。"""
+    sb = _BgStartedNoErrlogSandbox(missing=False)
+    r = _run_launch_probe(sb)
+    assert r["success"] is False and r["step"] == "launch", r
+    assert "已创建但始终为空" in r["error"], r["error"]
+
+
+def test_batch_page_semantics_are_consistent():
+    """pages_* 一律指"本批"，文档总页数单独给 pdf_total_pages（P1-1）。
+
+    add0229b：同一份返回里 pages_total=262（文档总页数）与
+    pages_ocred_total=10（本批页数）并存，模型据此算错剩余时间。
+    """
+    import asyncio as _asyncio
+
+    err = "[ocr_run] page 2/3 ok texts=10 elapsed=30.0s"
+    ns = _load_ocr_module()
+    sb = _ProgressSandbox(err)  # 文档共 20 页
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+    ns["_upload_precheck"] = None
+    ns["_resolve_host_path"] = None
+
+    r = _asyncio.run(ns["ocr_pdf_to_text"](
+        sandbox_id="sbx-test",
+        sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+        pages="1-3",
+        dpi=150,
+        wait_seconds=0,
+    ))
+    assert r["status"] == "running", r
+    assert r["pages_total"] == 3, r
+    assert r["pdf_total_pages"] == 20, r
+    assert r["pages_ocred_total"] == 3, r
+    assert r["pages_ocred"] == 2, r
+
+
+def test_silent_streak_escalates_to_suspected_dead():
+    """连续零 stderr ⇒ 提示里要出现"第 N 次 / 疑似已静默退出 / 建议按失败处理"（P1-2）。
+
+    三态时代"无输出"和"正在渲染"混在一起，模型到第 5 次续查才自己发现异常。
+    """
+    import asyncio as _asyncio
+
+    ns = _load_ocr_module()
+    sb = _ProgressSandbox("")  # err.log 空 ⇒ 第四态
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+    ns["_upload_precheck"] = None
+    ns["_resolve_host_path"] = None
+    ns["_OCR_SILENT_STREAK"].clear()
+
+    def _call():
+        return _asyncio.run(ns["ocr_pdf_to_text"](
+            sandbox_id="sbx-test",
+            sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+            pages="all",
+            dpi=150,
+            wait_seconds=0,
+        ))
+
+    first = _call()
+    assert "第 1 次" in first["progress_hint"], first["progress_hint"]
+    assert "建议按失败处理" not in first["progress_hint"], "第一次不该劝放弃"
+    second = _call()
+    assert "第 2 次" in second["progress_hint"], second["progress_hint"]
+    assert "建议按失败处理" in second["progress_hint"], second["progress_hint"]
+
+
+def test_ocr_runner_prints_start_marker_before_heavy_import():
+    """沙箱侧必须在 paddleocr import **之前**打 start 行（P0-2 的前提）。
+
+    启动探针只认 err.log 有没有内容；`from paddleocr import PaddleOCR` 要
+    5~15s，start 行若留在 env 行位置（import 之后），15s 探针窗口会把
+    "正在 import"误判成"没启动"，反而制造假失败。
+    """
+    tree = ast.parse(RUNNER_PY.read_text("utf-8"))
+    main_fn = _func_node(tree, "main")
+    body = [n for n in main_fn.body]
+    first = body[0]
+    assert isinstance(first, ast.Expr) and isinstance(first.value, ast.Call), (
+        "main() 的第一句必须是 print(start)，实际：%s" % ast.dump(first)[:120]
+    )
+    print_src = ast.get_source_segment(RUNNER_PY.read_text("utf-8"), first) or ""
+    assert "start" in print_src and "PROGRESS_PREFIX" in print_src, print_src
+    assert "flush=True" in print_src, "stderr 重定向到文件，必须 flush"
+
+
+def test_mcp_logger_is_not_swallowed():
+    """本模块 logger 必须自带 handler 且 level=INFO（P1-3）。
+
+    add0229b 排查时 MCP 日志里一条 `[OCR]` 都没有：`getLogger(__name__)` 没有
+    handler，root 默认 WARNING ⇒ 所有 logger.info 被 lastResort 丢弃，只有
+    `[DLP]`（warning 级）可见。缺这条，下次还得靠猜。
+    """
+    src = _src()
+    assert "logger.addHandler(" in src, "必须给模块 logger 挂 handler，否则 info 全被丢"
+    assert "logger.setLevel(logging.INFO)" in src, "必须显式抬到 INFO"
+    assert "logging.StreamHandler(sys.stderr)" in src, (
+        "handler 必须写 stderr——stdio 传输下 stdout 是协议流，污染即断连"
     )

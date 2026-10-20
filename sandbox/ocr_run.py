@@ -60,7 +60,11 @@ from pathlib import Path
 #          result.json 只在整批跑完才落地，轮询期间统计恒 0 ⇒ 模型误判
 #          "22 分钟零进展"（2026-10-20 会话 add0229b 事故）。进度行必须
 #          逐页 flush：stderr 被重定向到文件，缓冲住就等于没进度。
-__version__ = "1.2.0"
+#   1.2.1  首行 start 标记前移到**最前**（argparse 之前、paddleocr import 之前）。
+#          ★ 用途：MCP 侧的启动可见性探针靠 err.log 是否有内容判断"进程真
+#          起来了"。原 env 行在 `from paddleocr import PaddleOCR` 之后，paddle
+#          导入 5~15s，15s 探针窗口会误判成"没启动"。start 行 <1s 落地。
+__version__ = "1.2.1"
 
 #: 进度行前缀。MCP 侧 `_OCR_PROGRESS_MARK` 必须与此一致（有单测锁定）。
 PROGRESS_PREFIX = "[ocr_run] "
@@ -206,6 +210,11 @@ def _expand(paths, dpi: int = SAFE_DPI_DEFAULT):
 
 
 def main(argv=None) -> int:
+    # ★ 第一句就打 start 行：MCP 侧启动可见性探针只认 err.log 有没有内容，
+    #   而 `from paddleocr import PaddleOCR` 要 5~15s。放在 import 之后会让
+    #   探针把"正在 import"误判成"没起来"（1.2.1）。
+    print(PROGRESS_PREFIX + "start pid=%d argv=%s"
+          % (os.getpid(), " ".join(sys.argv[1:])[:300]), file=sys.stderr, flush=True)
     ap = argparse.ArgumentParser(description="沙箱侧 OCR（已内置 enable_mkldnn=False + det 边长限制）")
     ap.add_argument("paths", nargs="+", help="图片或 PDF 路径")
     ap.add_argument("--json", action="store_true", help="输出结构化 JSON（默认输出纯文本）")

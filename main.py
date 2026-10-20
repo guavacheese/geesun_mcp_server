@@ -3,6 +3,7 @@ import os
 import io
 import json
 import re
+import sys
 import asyncio
 import requests
 from fastmcp import FastMCP
@@ -16,6 +17,17 @@ from e2b_code_interpreter import Sandbox as E2BSandbox
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+# ★ 2026-10-20：MCP 侧此前一条 `[OCR]` 日志都看不到（add0229b 排查多花 1 小时）。
+#   `getLogger(__name__)` 没有任何 handler，root 默认 level=WARNING 且无 handler
+#   ⇒ 所有 logger.info 被 lastResort（WARNING）丢弃，只有 `[DLP]`（warning）可见。
+#   这里给本模块挂一个 stderr handler（**绝不能是 stdout**：stdio 传输会把
+#   stdout 当协议流）。level=INFO 只影响本模块，不动 global。
+_log_handler = logging.StreamHandler(sys.stderr)
+_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+)
+logger.addHandler(_log_handler)
+logger.setLevel(logging.INFO)
 
 decrypt_api_url = os.getenv("DECRYPT_API_URL")
 mcp = FastMCP("decrypt-file")
@@ -1157,12 +1169,29 @@ _OCR_POLL_INTERVAL = 5
 #: （streamable_http.py:104/711）——工具等更久也不会有人收，POST 到
 #: 300s 就被客户端 ReadTimeout 掐断。故 300 是"等到被掐"之前的极限。
 _OCR_WAIT_MAX = 300
-#: 后台任务启动可见性探针（2026-10-20 add0229b）。commands.run 未返回
-#: BG_STARTED 时给进程这么久落首个 stderr 行：ocr_run.py 启动即打 env 行，
-#: 真起来了 1~2s 就有内容；这么久还空 ⇒ 进程根本没起来，立刻显式失败。
-#: 不能让模型对着一个不存在的任务续查 5 次、等 22 分钟（事故原样）。
-_OCR_LAUNCH_PROBE_TRIES = 10
+#: 后台任务启动可见性探针（2026-10-20 add0229b）。
+#: ★ 探针**无条件**执行，不再由 BG_STARTED 短路：BG_STARTED 只证明 nohup
+#:   这一层起来了，`bash -c` 命令串被截断时 echo 照常输出而 python3 从未
+#:   执行（add0229b 第二轮实锤：11 次调用全是 running/pages_ocred=0）。
+#: 判据 = err.log 有内容（ocr_run.py 第一句就打 start 行，<1s）或 done.flag
+#: 出现；两者皆无 ⇒ 进程根本没起来，立刻显式失败。15s 是给沙箱冷启动留
+#: 的余量（首个 stderr 行不等 PaddleOCR import，见 sandbox/ocr_run.py 的
+#: start 行位置）。
+_OCR_LAUNCH_PROBE_TRIES = 15
 _OCR_LAUNCH_PROBE_INTERVAL = 1
+#: 连续"零 stderr"续查计数：键 = sandbox_id|指纹。正常不会走到这里（启动探针
+#: 已把"没起来"判死），万一进程静默退出，靠它把"第 N 次全无输出"透给模型，
+#: 而不是让模型自己第 5 次才发现。best-effort，进程内计数，超 64 键清空。
+_OCR_SILENT_STREAK: dict[str, int] = {}
+
+
+def _bump_silent_streak(key: str) -> int:
+    """记录并返回某指纹连续"零 stderr"的续查次数。"""
+    if len(_OCR_SILENT_STREAK) > 64:
+        _OCR_SILENT_STREAK.clear()
+    n = _OCR_SILENT_STREAK.get(key, 0) + 1
+    _OCR_SILENT_STREAK[key] = n
+    return n
 #: 进度标记：ocr_run.py 每页往 stderr 打一行 `[ocr_run] page i/n ...`。
 #: pages_ocred 从这里解析——result.json 只在整批跑完才落地，轮询期间
 #: 拿它统计只会恒 0（add0229b：模型看 22 分钟"0 页"判定卡死，转去解析
@@ -1259,6 +1288,38 @@ async def _ensure_ocr_runner(sandbox_id: str) -> dict:
         return {"success": False, "version": version, "error": wr.get("error")}
     logger.info("[OCR] 下发 ocr_run.py v%s → %s (%d bytes)", version, _OCR_ENTRY, len(payload))
     return {"success": True, "version": version, "error": None}
+
+
+def _build_ocr_launch_cmd(
+    entry: str, ocr_input: str, dpi: int, out_json: str, out_err: str, out_done: str
+) -> str:
+    """拼 OCR 后台启动命令。**整串 shlex.quote，绝不手工拼单引号。**
+
+    ★ 2026-10-20 add0229b 第二轮真根因（67 上 A/B 实测）：
+      旧写法是 `nohup bash -c 'python3 %s %s ...' ...`，外层手写单引号，而
+      里面的路径经过 shlex.quote()——**含空格的路径**会被包成单引号形式，
+      两者嵌套 ⇒ bash 在第一个内层单引号处截断命令串，后半截（重定向 +
+      `echo $? > done.flag`）全变成 `bash -c` 的位置参数：
+
+        无空格 long.pdf                        → argv=[ocr_run.py long.pdf --json --dpi 150]，产物齐全
+        含空格 "康视达 CST2026手册.pdf.sub.pdf" → argv=[ocr_run.py "/home/user/_ocr/康视达"]
+                                                → result.json/err.log/done.flag 一个都不产生
+
+      而 `echo BG_STARTED` 在前台照常输出 ⇒ MCP 判定"仍在跑"、pages_ocred 恒 0，
+      模型空等 22 分钟 → 转去自己解析文本层 → 被循环检测硬停。
+      修法：先拼 inner，再对整串 shlex.quote（单引号嵌套由 shlex 的 `'"'"'`
+      形式保证安全）。单测 `test_launch_cmd_roundtrip_with_special_chars`
+      用 shlex.split 往返锁定，等价的真实 bash 行为在 67 上另行验证。
+    """
+    inner = "python3 %s %s --json --dpi %d > %s 2> %s; echo $? > %s" % (
+        shlex.quote(entry),
+        shlex.quote(ocr_input),
+        int(dpi),
+        shlex.quote(out_json),
+        shlex.quote(out_err),
+        shlex.quote(out_done),
+    )
+    return "nohup bash -c %s </dev/null >/dev/null 2>&1 & echo BG_STARTED" % shlex.quote(inner)
 
 
 async def _ocr_task_age_seconds(sandbox_id: str, err_path: str) -> int:
@@ -1564,6 +1625,28 @@ async def ocr_pdf_to_text(
         text = (st.get("stdout") or "").strip()
         return text or None
 
+    async def _errlog_state() -> tuple[bool, int]:
+        """err.log 是否存在、有多少字节。
+
+        必须区分"文件不存在"与"文件存在但为空"：前者 = 启动命令没跑到底
+        （引号截断/路径错误），后者 = shell 跑了但 python3 没执行。两种故障
+        的修法完全不同，返回给模型的文案要分开（add0229b 二轮就是分不清）。
+        """
+        st = await _sandbox_run(
+            sandbox_id,
+            "if [ -e {0} ]; then wc -c < {0}; else echo MISSING; fi".format(
+                shlex.quote(out_err)
+            ),
+            timeout=30,
+        )
+        raw = (st.get("stdout") or "").strip()
+        if not raw or "MISSING" in raw:
+            return (False, 0)
+        try:
+            return (True, int(raw.split()[0]))
+        except (ValueError, IndexError):
+            return (False, 0)
+
     async def _read_fingerprint() -> str | None:
         st = await _sandbox_run(
             sandbox_id, "cat %s 2>/dev/null" % shlex.quote(out_meta), timeout=30
@@ -1609,6 +1692,7 @@ async def ocr_pdf_to_text(
                     warnings0: list[str] = [
                         "复用沙箱内已有 OCR 结果（参数指纹一致，未重跑）"
                     ]
+                    _OCR_SILENT_STREAK.pop("%s|%s" % (sandbox_id, fingerprint), None)
                     return await _ocr_collect(
                         sandbox_id, out_json, out_err, page_count, want, pages, dpi,
                         t0, warnings0, n_pages, target_pdf,
@@ -1658,58 +1742,78 @@ async def ocr_pdf_to_text(
         runner = await _ensure_ocr_runner(sandbox_id)
         if not runner["success"]:
             return _fail("prepare", "下发沙箱侧 ocr_run.py 失败: %s" % runner["error"])
-        # 启动命令单独一条：`nohup ... &` 只后台化 nohup 自身，echo 在前台，
-        # shell 立刻退出、管道立刻关闭 ⇒ commands.run 秒级返回。
-        launch_cmd = (
-            "nohup bash -c 'python3 %s %s --json --dpi %d > %s 2> %s; echo $? > %s' "
-            "</dev/null >/dev/null 2>&1 & echo BG_STARTED"
-            % (
-                shlex.quote(_OCR_ENTRY),
-                shlex.quote(target_pdf),
-                int(dpi),
-                shlex.quote(out_json),
-                shlex.quote(out_err),
-                shlex.quote(out_done),
+        # ── P0-3：输入路径归一化 ──
+        # 把待 OCR 文件落到固定路径 `_OCR_WORKDIR/input.pdf` 再喂给 ocr_run.py，
+        # 从根上免疫文件名里的空格/中文/引号/`$`（原实现直接把 target_pdf 塞进
+        # 命令行，只要中间多一层 shell 就出事，见下面的引号事故）。
+        # 归一化失败**不阻断**：启动命令已整串 quote，任意文件名都安全，这里
+        # 只是加固，退回原路径并留 warning 即可。
+        ocr_input = target_pdf
+        fixed_input = "%s/input.pdf" % _OCR_WORKDIR
+        for probe_cmd, mark in (
+            (
+                "ln -sf %s %s; test -s %s && echo LINKED"
+                % (shlex.quote(target_pdf), shlex.quote(fixed_input), shlex.quote(fixed_input)),
+                "LINKED",
+            ),
+            (
+                "cp -f %s %s && test -s %s && echo COPIED"
+                % (shlex.quote(target_pdf), shlex.quote(fixed_input), shlex.quote(fixed_input)),
+                "COPIED",
+            ),
+        ):
+            norm = await _sandbox_run(sandbox_id, probe_cmd, timeout=600)
+            if mark in (norm.get("stdout") or ""):
+                ocr_input = fixed_input
+                break
+        if ocr_input != fixed_input:
+            logger.warning(
+                "[OCR] 输入路径归一化失败（ln/cp 均不可用），退回原路径 %s：%s",
+                target_pdf,
+                (norm.get("stderr") or "")[:200] or "无 stderr",
             )
+        # ── 启动命令：整串 quote，绝不手工拼单引号（见 _build_ocr_launch_cmd）──
+        launch_cmd = _build_ocr_launch_cmd(
+            _OCR_ENTRY, ocr_input, int(dpi), out_json, out_err, out_done
         )
         launch = await _sandbox_run(sandbox_id, launch_cmd, timeout=60)
         done_code = await _poll_done()
         # done_code 非 None ⇒ bash -c 秒退（python3 不存在/参数错等），
         # 直接落到下面的退出码分流，不走轮询。
-        # 启动可见性：没看到 BG_STARTED（或 commands.run 自己异常）时**不能
-        # 静默放过**——先给进程一点时间落首个 stderr 行（ocr_run.py 启动即打
-        # env 行），既没 done.flag 也没 err.log 内容 ⇒ 后台任务根本没起来，
-        # 立刻显式失败。add0229b 的 22 分钟空等正是这里静默造成的。
-        if done_code is None and "BG_STARTED" not in (launch.get("stdout") or ""):
+        # ★ P0-2：启动可见性必须**无条件**验证，不能被 BG_STARTED 短路。
+        #   BG_STARTED 只证明 nohup 起了；引号截断那种事故里它照样输出，而
+        #   python3 从未执行——正是这条短路让 add0229b 静默等了 22 分钟。
+        if done_code is None:
             launch_visible = False
+            errlog_exists = False
             for _ in range(_OCR_LAUNCH_PROBE_TRIES):
                 await _asyncio.sleep(_OCR_LAUNCH_PROBE_INTERVAL)
                 done_code = await _poll_done()
                 if done_code is not None:
                     launch_visible = True  # 秒退：退出码分流能给出真实原因
                     break
-                err_size = await _sandbox_run(
-                    sandbox_id,
-                    "wc -c < %s 2>/dev/null || echo 0" % shlex.quote(out_err),
-                    timeout=30,
-                )
-                try:
-                    first = (err_size.get("stdout") or "0").strip().split()
-                    if first and int(first[0]) > 0:
-                        launch_visible = True  # 已有 stderr ⇒ 进程真起来了
-                        break
-                except (ValueError, IndexError):
-                    continue
+                errlog_exists, errlog_size = await _errlog_state()
+                if errlog_size > 0:
+                    launch_visible = True  # 有 stderr ⇒ python3 真起来了
+                    break
             if not launch_visible:
+                window = _OCR_LAUNCH_PROBE_TRIES * _OCR_LAUNCH_PROBE_INTERVAL
                 return _fail(
                     "launch",
-                    "OCR 后台任务未能启动：commands.run 未返回 BG_STARTED，"
-                    "且 %ds 内 err.log 无任何输出（进程从未起来）。"
-                    "launch_stderr=%r; launch_stdout=%r"
+                    "OCR 后台任务未能启动：%ds 内 err.log %s。"
+                    "BG_STARTED=%s 只代表 nohup 这一层起了，不代表 python3 起了"
+                    "（启动命令被截断时 echo 照常输出）。"
+                    "launch_stdout=%r; launch_stderr=%r"
                     % (
-                        _OCR_LAUNCH_PROBE_TRIES * _OCR_LAUNCH_PROBE_INTERVAL,
-                        (launch.get("stderr") or "")[:300],
+                        window,
+                        (
+                            "始终未被创建——启动命令没跑到底（路径/引号问题）"
+                            if not errlog_exists
+                            else "已创建但始终为空——python3 未真正执行"
+                        ),
+                        "收到" if "BG_STARTED" in (launch.get("stdout") or "") else "缺失",
                         (launch.get("stdout") or "")[:200],
+                        (launch.get("stderr") or "")[:300],
                     ),
                 )
 
@@ -1723,24 +1827,43 @@ async def ocr_pdf_to_text(
                 sandbox_id, "tail -n 20 %s 2>/dev/null" % shlex.quote(out_err), timeout=30
             )
             err_tail = (tail.get("stdout") or "").strip()
-            ocred, ocred_total = _parse_ocr_progress(err_tail)
-            if ocred_total is None:
-                ocred_total = n_pages
+            ocred, _parsed_total = _parse_ocr_progress(err_tail)
+            # ★ pages_* 语义统一到"本批"：此前 pages_total 返回文档总页数
+            #   （262）而 pages_ocred_total 返回本批页数（10），同一份返回里两个
+            #   "total" 互相矛盾，模型据此算错剩余时间（add0229b 实锤）。
+            #   文档总页数单独用 pdf_total_pages 给。
+            ocred_total = n_pages
+            streak_key = "%s|%s" % (sandbox_id, fingerprint)
             if ocred > 0:
+                _OCR_SILENT_STREAK.pop(streak_key, None)
                 stage = "正在逐页 OCR（已处理 %d/%d 页）" % (ocred, ocred_total)
             elif err_tail:
+                _OCR_SILENT_STREAK.pop(streak_key, None)
                 stage = (
                     "正在渲染 PDF 页面（渲染是整批做的，渲染完才开始逐页 OCR，"
                     "此阶段进度为 0 属正常）"
                 )
             else:
-                stage = "尚未产生任何 stderr 输出"
+                # 第四态：进程一声不响。启动探针已经把"没起来"判死，走到这里
+                # 说明进程起来后静默退出/被 SIGKILL——必须让模型能识别，
+                # 而不是第 5 次续查才自己发现（原三态里这一态和"正在渲染"混在
+                # 一起，模型无从区分）。
+                streak = _bump_silent_streak(streak_key)
+                stage = (
+                    "进程尚未产生任何 stderr 输出（第 %d 次，疑似已静默退出）"
+                    % streak
+                )
+                if streak >= 2:
+                    stage += "——建议按失败处理，用 execute 检查 err.log 与进程状态"
             return {
                 "success": True,
                 "step": None,
                 "error": None,
                 "status": "running",
-                "pages_total": page_count,
+                # pages_total = 本批要 OCR 的页数（与 pages_ocred 同量纲）
+                "pages_total": n_pages,
+                # PDF 总页数（pages 参数只取子集时与 pages_total 不同）
+                "pdf_total_pages": page_count,
                 "pages_ocred": ocred,
                 "pages_ocred_total": ocred_total,
                 "pages_failed": 0,
@@ -1757,14 +1880,15 @@ async def ocr_pdf_to_text(
                     "请用完全相同的参数再调一次本工具续查/取结果——"
                     "参数指纹一致不会重复上传、也不会重跑 OCR。"
                     "PDF 在沙箱内 %s（目录 %s），**不要重新上传**。"
-                    "150dpi 实测约 30s/页，本批 %d 页可据此估算剩余时间；"
-                    "err.log 尾部：%s"
+                    "150dpi 实测约 30s/页，本批 %d 页（文档共 %d 页）"
+                    "可据此估算剩余时间；err.log 尾部：%s"
                     % (
                         wait_seconds,
                         stage,
                         target_pdf,
                         _OCR_WORKDIR,
                         n_pages,
+                        page_count,
                         err_tail.splitlines()[-1][:200] if err_tail else "(空)",
                     )
                 ),
@@ -1775,6 +1899,7 @@ async def ocr_pdf_to_text(
     # ── 4c. 进程结束：按退出码分流 ──
     # 终验指纹：轮询期间若有别的参数组合的任务也写了 done.flag，此时收上来
     # 的会是它的产物——宁可显式失败让模型重试，也不返回错页范围的数据。
+    _OCR_SILENT_STREAK.pop("%s|%s" % (sandbox_id, fingerprint), None)
     final_fp = await _read_fingerprint()
     if final_fp is not None and final_fp != fingerprint:
         return _fail(
@@ -1881,7 +2006,11 @@ async def _ocr_collect(
         "step": None,
         "error": None,
         "status": "completed",
-        "pages_total": page_count,
+        # 与 running 分支同口径：pages_* 一律指"本批"，文档总页数用
+        # pdf_total_pages（此前 pages_total=文档总页数、pages_ocred=本批页数，
+        # 同一份返回里两个 total 互相矛盾）。
+        "pages_total": n_pages,
+        "pdf_total_pages": page_count,
         "pages_ocred": len(recs),
         "pages_failed": failed,
         "total_texts": total_texts,
