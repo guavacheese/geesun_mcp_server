@@ -391,7 +391,12 @@ def _load_ocr_module():
     tree = ast.parse(src)
     want_names = {"ocr_pdf_to_text", "_ocr_collect", "_fail", "_parse_page_spec",
                   "_first_json_value", "_parse_ocr_progress", "_ocr_task_age_seconds",
-                  "_bump_silent_streak", "_build_ocr_launch_cmd"}
+                  "_bump_silent_streak", "_build_ocr_launch_cmd",
+                  # 分批（方案 B，2026-10-20）
+                  "_page_span_text", "_plan_ocr_batches", "_batch_state_new",
+                  "_batch_current_index", "_batch_summary", "_batch_state_load",
+                  "_batch_state_save", "_batch_concat_texts", "_ocr_batch_finish",
+                  "_ocr_batch_settle"}
     body = [n for n in tree.body
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in want_names]
     assert len(body) == len(want_names), "依赖函数不全：%s" % [n.name for n in body]
@@ -439,6 +444,9 @@ def _load_ocr_module():
     workdir = ns.get("_OCR_WORKDIR", "/home/user/_ocr")
     ns["_OCR_ENTRY"] = "%s/ocr_run.py" % workdir
     ns["_OCR_IMAGE_ENTRY"] = "/opt/ocr/ocr_run.py"
+    # 分批常量同样是 BinOp（`"%s/batches" % _OCR_WORKDIR`），literal_eval 吃不下
+    ns["_OCR_BATCH_DIR"] = "%s/batches" % workdir
+    ns["_OCR_BATCH_STATE"] = "%s/batches/state.json" % workdir
     # 下发动作在单测里用 stub 顶替（真实下发的测试见
     # test_ocr_runner_shipped_*，那里 mock 掉 _sandbox_write）。
     ns["_ensure_ocr_runner"] = _stub_ensure_runner
@@ -1331,3 +1339,351 @@ def test_completed_result_has_same_page_fields_as_running():
     seg = ast.get_source_segment(src, node)
     for key in ("pages_total", "pdf_total_pages", "pages_ocred", "pages_ocred_total"):
         assert '"%s"' % key in seg, "completed 返回缺少字段 %s" % key
+
+
+# ────────── 自动分批（方案 B，2026-10-20）──────────
+# 要守的不是"分批算法对不对"（纯函数直接测），而是三条产品语义：
+#   ① 分批 ≠ 截断：一页都不许丢，总页数不设上限；
+#   ② 一次调用只推进一批，**绝不是"第一批完成就 completed"**（那是静默截断）；
+#   ③ 某批失败只影响该批，且必须在 warnings 里显式列出（用户要知道缺了哪段）。
+
+
+def test_page_span_text_folds_continuous_ranges():
+    """页范围文本：连续折叠成 a-b，非连续列段，超限折叠。"""
+    ns = _load_ocr_module()
+    span = ns["_page_span_text"]
+    assert span([81, 82, 83, 84]) == "81-84"
+    assert span([1]) == "1"
+    assert span([1, 2, 3, 7, 9, 10]) == "1-3,7,9-10"
+    assert span([]) == "空"
+    # 超过 limit 段 ⇒ 折叠并带上总页数，避免把 262 个页号糊进提示
+    many = list(range(1, 30, 2))  # 1,3,5,...,29 = 15 段
+    text = span(many, limit=3)
+    assert text.startswith("1,3,5") and "等 15 页" in text, text
+
+
+def test_plan_ocr_batches_covers_every_page_exactly_once():
+    """分批必须覆盖全部页、不重不漏，且**不设总页数上限**（分批≠截断）。
+
+    262 页 / 40 ⇒ 7 批（40×6 + 22）。1000 页 / 40 ⇒ 25 批。
+    这是"总页数不设限"的直接证明：批数随页数增长，页集合恒等于全集。
+    """
+    ns = _load_ocr_module()
+    plan = ns["_plan_ocr_batches"]
+    for total, size in ((262, 40), (1000, 40), (100, 40), (81, 40), (40, 40), (39, 40)):
+        groups = plan(list(range(total)), size)
+        flat = [p for g in groups for p in g]
+        assert flat == list(range(total)), (
+            "总页数 %d、批大小 %d 时页集合与全集不一致（丢页或重复）" % (total, size)
+        )
+        assert len(flat) == len(set(flat)), "存在重复页"
+        assert all(len(g) <= size for g in groups), "有批次超过 batch_pages"
+        assert len(groups) == (total + size - 1) // size, (
+            "批数不对：%d 页 / %d ⇒ %d 批，实际 %d" % (total, size, (total + size - 1) // size, len(groups))
+        )
+    # 不分批的两条路径
+    assert plan(list(range(20)), 40) == [list(range(20))]
+    assert plan(list(range(20)), 0) == [list(range(20))]
+
+
+def test_batch_current_index_skips_finished_and_failed():
+    """当前批 = 第一个 pending/running；失败批不自动重试（坏 PDF 会无限重试）。"""
+    ns = _load_ocr_module()
+    cur = ns["_batch_current_index"]
+    st = ns["_batch_state_new"]("fp", [[0, 1], [2, 3], [4]], 2, 0.0)
+    assert cur(st) == 0
+    st["batches"][0]["status"] = "done"
+    st["batches"][1]["status"] = "failed"
+    assert cur(st) == 2, "失败批应被跳过，直接推进到下一批"
+    st["batches"][2]["status"] = "done"
+    assert cur(st) is None, "全部结束必须返回 None"
+    st["batches"][0]["status"] = "running"
+    assert cur(st) == 0, "running 必须被接管（进程可能仍在跑，由判活闸门决定续等还是重启）"
+
+
+def test_batch_summary_counts_done_only():
+    """汇总只统计 done 批（failed 的 ocred 不计入进度，否则模型会高估完成度）。"""
+    ns = _load_ocr_module()
+    st = ns["_batch_state_new"]("fp", [[0, 1], [2], [3, 4]], 2, 0.0)
+    st["batches"][0].update(status="done", ocred=2, texts=10)
+    st["batches"][1].update(status="failed", error="exit=1")
+    st["batches"][2].update(status="done", ocred=2, texts=7)
+    s = ns["_batch_summary"](st)
+    assert s["batches_done"] == 2, s
+    assert s["pages_ocred_doc"] == 4, s
+    assert s["total_texts_doc"] == 17, s
+    assert len(s["batches_failed"]) == 1, s
+    assert s["batches_failed"][0]["batch"] == 2, s
+    assert s["batches_failed"][0]["pages"] == "3", s
+    assert s["batches_failed"][0]["error"] == "exit=1", s
+
+
+class _BatchSandbox:
+    """模拟"分批推进"的沙箱：跨多次工具调用保持状态。
+
+    · ``launched``  已收到 nohup 启动命令的批次目录号（模拟进程已跑完）
+    · ``fail_batches``  这些批启动后"秒退 exit=1 且不产 result.json"
+    · state.json / ocr.meta / result.txt 通过 write 落库，read 时回取——
+      这正是 MCP 侧"无状态、进度只能存沙箱"的真实形态。
+    """
+
+    def __init__(self, page_count: int, batch_pages: int, fail_batches=()):
+        self.page_count = page_count
+        self.batch_pages = batch_pages
+        self.fail_batches = set(fail_batches)
+        self.launched: set[int] = set()
+        self.commands: list[str] = []
+        self.state_bytes: bytes | None = None
+        self.metas: dict[int, str] = {}
+        self.texts: dict[int, str] = {}
+        # 每批页数（最后一批可能不满）。键 0 = 根路径（单批模式，不分批）。
+        n_batch = (page_count + batch_pages - 1) // batch_pages
+        self.pages_by_idx = {
+            i + 1: min(batch_pages, page_count - i * batch_pages) for i in range(n_batch)
+        }
+        self.pages_by_idx[0] = page_count
+
+    @staticmethod
+    def _bidx(cmd: str) -> int | None:
+        m = re.search(r"/batches/b(\d{3})/", cmd)
+        return int(m.group(1)) if m else None
+
+    async def run(self, sandbox_id, cmd, timeout=None):
+        self.commands.append(cmd)
+        idx = self._bidx(cmd)
+        if "LINKED" in cmd or "COPIED" in cmd:
+            return {"success": True, "stdout": "LINKED\n", "stderr": ""}
+        if "wc -c <" in cmd:  # 启动可见性探针：err.log 有 start 行
+            return {"success": True, "stdout": "48\n", "stderr": ""}
+        if cmd.startswith("test -f /home/user/_ocr/e2e.pdf"):
+            return {"success": True, "stdout": "OK\n", "stderr": ""}
+        if "grep -m1" in cmd:
+            return {"success": True, "stdout": '__version__ = "1.2.1"\nOK\n', "stderr": ""}
+        if cmd.startswith("head -c"):  # 收口时的 preview
+            return {"success": True, "stdout": "PREVIEW-ALL", "stderr": ""}
+        if cmd.startswith("cat ") and "result.txt" in cmd and ">" in cmd:  # 合并全文
+            return {"success": True, "stdout": "", "stderr": ""}
+        if cmd.startswith("cat ") and "done.flag" in cmd:
+            key = idx or 0
+            if key in self.launched:
+                return {"success": True, "stdout": "0\n" if key not in self.fail_batches else "1\n",
+                        "stderr": ""}
+            return {"success": True, "stdout": "", "stderr": ""}
+        if cmd.startswith("cat ") and "ocr.meta" in cmd:
+            return {"success": True, "stdout": (self.metas.get(idx or 0, "") + "\n"), "stderr": ""}
+        if cmd.startswith("test -s ") and "result.json" in cmd:
+            key = idx or 0
+            if key in self.launched and key not in self.fail_batches:
+                return {"success": True, "stdout": "OK\n", "stderr": ""}
+            return {"success": True, "stdout": "", "stderr": ""}
+        if "stat -c %Y" in cmd:  # 判活：err.log 新鲜
+            return {"success": True, "stdout": "AGE=5\n", "stderr": ""}
+        if "nohup bash -c" in cmd:
+            self.launched.add(idx or 0)
+            return {"success": True, "stdout": "BG_STARTED\n", "stderr": ""}
+        if "mkdir -p" in cmd and "rm -f" in cmd:  # 清场（只清本批目录）
+            return {"success": True, "stdout": "", "stderr": ""}
+        if "mkdir -p" in cmd and "_page.py" in cmd:  # 拆分本批子 PDF
+            m = re.search(r"_page\.py\s+\S+(.*)$", cmd)
+            picked = len((m.group(1) if m else "").split())
+            if picked:
+                self.pages_by_idx[idx or 0] = picked
+            return {"success": True, "stdout": "SPLIT_OK\n", "stderr": ""}
+        if cmd.endswith("_page.py /home/user/_ocr/e2e.pdf"):  # 页数探测
+            return {"success": True, "stdout": "%d\n" % self.page_count, "stderr": ""}
+        if cmd.startswith("tail -n"):
+            return {"success": True, "stdout": "[ocr_run] page 1/%d ok texts=1" % self.batch_pages,
+                    "stderr": ""}
+        return {"success": True, "stdout": "", "stderr": ""}
+
+    async def write(self, sandbox_id, path, data):
+        idx = self._bidx(path)
+        if path.endswith("state.json"):
+            self.state_bytes = data
+        elif path.endswith("ocr.meta"):
+            self.metas[idx or 0] = data.decode("utf-8")
+        elif path.endswith("result.txt"):
+            self.texts[idx or 0] = data.decode("utf-8")
+        return {"success": True, "error": None}
+
+    async def read(self, sandbox_id, path):
+        if path.endswith("state.json"):
+            if self.state_bytes is None:
+                return {"success": False, "data": b"", "error": "not found"}
+            return {"success": True, "data": self.state_bytes, "error": None}
+        if path.endswith("result.json"):
+            key = self._bidx(path) or 0
+            if key not in self.launched or key in self.fail_batches:
+                return {"success": False, "data": b"", "error": "not found"}
+            recs = [
+                {"page": i + 1, "ok": True, "texts": ["B%d-P%d" % (key, i + 1)]}
+                for i in range(self.pages_by_idx.get(key, 0))
+            ]
+            return {"success": True, "data": json.dumps(recs).encode(), "error": None}
+        return {"success": False, "data": b"", "error": "not found"}
+
+
+def _batch_env(page_count=100, batch_pages=40, fail_batches=()):
+    import asyncio as _asyncio
+
+    ns = _load_ocr_module()
+    sb = _BatchSandbox(page_count, batch_pages, fail_batches)
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+    ns["_upload_precheck"] = None
+    ns["_resolve_host_path"] = None
+
+    def _call(pages="all", dpi=150, wait=0):
+        return _asyncio.run(ns["ocr_pdf_to_text"](
+            sandbox_id="sbx-test",
+            sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+            pages=pages,
+            dpi=dpi,
+            wait_seconds=wait,
+            batch_pages=batch_pages,
+        ))
+
+    return ns, sb, _call
+
+
+def test_batch_mode_advances_one_batch_per_call():
+    """一次调用只推进一批，且**中间批次绝不返回 completed**（防静默截断）。
+
+    100 页 / 40 ⇒ 3 批。旧行为会是"第一批跑完就 completed"，用户只拿到 40 页
+    却以为拿到全本——这比失败更糟。必须：每批完成 ⇒ running + 明确的
+    "第 N 批尚未启动，同参再调一次"，最后一颗批完成才 completed。
+    """
+    _ns, _sb, call = _batch_env(page_count=100, batch_pages=40)
+
+    r1 = call()
+    assert r1["status"] == "running", "第 1 批完成后不得返回 completed：%s" % r1
+    assert r1["batch"] == "2/3", r1
+    assert r1["batch_count"] == 3, r1
+    assert r1["batch_pages"] == "41-80", r1
+    assert r1["batches_done"] == 1, r1
+    assert r1["pages_ocred_doc"] == 40, r1
+    assert r1["pdf_total_pages"] == 100, r1
+    assert "不要重新上传" in r1["progress_hint"], r1["progress_hint"]
+    assert "尚未启动" in r1["progress_hint"], r1["progress_hint"]
+
+    r2 = call()
+    assert r2["status"] == "running", r2
+    assert r2["batch"] == "3/3", r2
+    assert r2["batches_done"] == 2, r2
+    assert r2["pages_ocred_doc"] == 80, r2
+
+    r3 = call()
+    assert r3["status"] == "completed", "最后一批完成才允许 completed：%s" % r3
+    assert r3["batch"] == "3/3", r3
+    assert r3["success"] is True, r3
+    assert r3["pdf_total_pages"] == 100, r3
+    # 一页不丢：40 + 40 + 20
+    assert r3["pages_ocred_doc"] == 100, r3
+    assert r3["pages_total"] == 100, r3
+    assert r3["preview"] == "PREVIEW-ALL", r3
+    assert r3["batches_failed"] == [], r3
+
+    # 第 4 次调用：已收口 ⇒ 直接返回 completed，不得再启动进程
+    n_launch = sum(1 for c in _sb.commands if "nohup bash -c" in c)
+    r4 = call()
+    assert r4["status"] == "completed", r4
+    assert sum(1 for c in _sb.commands if "nohup bash -c" in c) == n_launch, (
+        "全部批次完成后再次调用，不得重新启动任何进程"
+    )
+
+
+def test_batch_artifacts_are_isolated_per_batch():
+    """每批产物落在自己的 batches/bNNN/ 下，清场只清本批（否则前序批全丢）。"""
+    _ns, sb, call = _batch_env(page_count=100, batch_pages=40)
+    call()
+    joined = "\n".join(sb.commands)
+    assert "/batches/b001/result.json" in joined, "第 1 批产物应落在 batches/b001/ 下"
+    assert "/batches/b001/done.flag" in joined, joined[:400]
+    # 清场命令里不得出现根目录产物（那会删掉别的批）
+    preps = [c for c in sb.commands if "mkdir -p" in c and "rm -f" in c]
+    assert preps, "找不到清场命令"
+    for p in preps:
+        rm_part = p.split("rm -f", 1)[1]
+        assert "/batches/b" in rm_part, "清场目标不在批目录内：%s" % p
+        assert "/home/user/_ocr/result.json" not in rm_part, (
+            "清场删到了根目录 result.json（会踩别的批次/单批任务）：%s" % p
+        )
+    # 每批一个子 PDF，避免第 2 批把第 1 批的子 PDF 覆盖掉
+    assert "/batches/b001/input.sub.pdf" in joined, joined[:600]
+
+
+def test_batch_failure_is_skipped_and_reported():
+    """某批失败：不阻断其它批，但必须在 warnings 里点名（缺哪段要能补救）。
+
+    这是"失败只丢当前批"的产品含义：第 2 批（41-80 页）挂了，用户仍然拿到
+    第 1、3 批的文本，并且**知道** 41-80 缺失、可以用 pages="41-80" 补跑。
+    静默跳过等于交付残缺而不告知。
+    """
+    _ns, _sb, call = _batch_env(page_count=100, batch_pages=40, fail_batches=(2,))
+
+    r1 = call()
+    assert r1["status"] == "running" and r1["batch"] == "2/3", r1
+
+    r2 = call()  # 第 2 批失败
+    assert r2["status"] == "running", "单批失败不得中断整轮：%s" % r2
+    assert r2["batch"] == "3/3", r2
+    assert r2["batches_done"] == 1, r2
+    assert any("第 2 批" in w and "失败" in w for w in r2["warnings"]), r2["warnings"]
+
+    r3 = call()  # 第 3 批完成 ⇒ 收口
+    assert r3["status"] == "completed", r3
+    assert r3["success"] is True, "第 1、3 批有文本，整体仍应算成功：%s" % r3
+    assert r3["pages_ocred_doc"] == 60, "40 + 20，失败批不计入：%s" % r3
+    assert len(r3["batches_failed"]) == 1, r3
+    assert r3["batches_failed"][0]["batch"] == 2, r3
+    assert r3["batches_failed"][0]["pages"] == "41-80", r3
+    assert any("41-80" in w for w in r3["warnings"]), (
+        "收口时必须告诉用户哪几页缺失、怎么补：%s" % r3["warnings"]
+    )
+
+
+def test_batch_state_restarts_when_fingerprint_changes():
+    """参数变了（dpi）⇒ 分批状态必须重开，不得沿用旧批次进度。
+
+    指纹含「源 PDF + dpi + 批大小 + 目标页集合」，任一变化都是新任务。
+    沿用旧 state 的后果：第 2 批的产物被当成第 1 批交付，页范围错位。
+    """
+    _ns, sb, call = _batch_env(page_count=100, batch_pages=40)
+    r1 = call()
+    assert r1["batches_done"] == 1, r1
+
+    r2 = call(dpi=200)
+    # 重开后只完成"新 state 的第 1 批"；若沿用旧 state，这里会是第 2 批完成（=2）
+    assert r2["batches_done"] == 1, (
+        "dpi 变了应重开分批状态（只完成新第 1 批），实际 batches_done=%s，batch=%s"
+        % (r2.get("batches_done"), r2.get("batch"))
+    )
+    state = json.loads(sb.state_bytes.decode("utf-8"))
+    assert "dpi=200" in state["fingerprint"], state["fingerprint"]
+    assert state["batch_count"] == 3, state
+
+
+def test_batch_mode_requires_explicit_opt_in_via_page_count():
+    """目标页数 ≤ batch_pages ⇒ 走原单批路径，返回里不得出现批次字段。"""
+    _ns, _sb, call = _batch_env(page_count=20, batch_pages=40)
+    r = call()
+    assert r["status"] == "completed", r
+    assert "batch" not in r, "单批路径不应出现 batch 字段：%s" % r
+    assert r["pages_ocred"] == 20, r
+
+
+def test_batch_pages_param_is_declared_and_clamped():
+    """batch_pages 必须在 schema 里（默认 0=自动），且被钳到 <=_OCR_BATCH_PAGES_MAX。"""
+    src = _src()
+    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    args = [a.arg for a in node.args.args]
+    assert "batch_pages" in args, "ocr_pdf_to_text 缺少 batch_pages 参数（模型无法控制批大小）"
+    defaults = dict(zip(args[-len(node.args.defaults):], node.args.defaults))
+    assert isinstance(defaults.get("batch_pages"), ast.Constant), defaults
+    assert defaults["batch_pages"].value == 0, "batch_pages 默认必须是 0（自动）"
+    assert "_OCR_BATCH_PAGES_MAX" in src and "min(batch_pages, _OCR_BATCH_PAGES_MAX)" in src, (
+        "batch_pages 必须被 _OCR_BATCH_PAGES_MAX 钳制，否则模型传 9999 就把分批退化成"
+        "一次性全量（正是本改动要消灭的形态）"
+    )

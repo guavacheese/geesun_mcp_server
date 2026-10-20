@@ -1185,6 +1185,30 @@ _OCR_LAUNCH_PROBE_INTERVAL = 1
 #: 而不是让模型自己第 5 次才发现。best-effort，进程内计数，超 64 键清空。
 _OCR_SILENT_STREAK: dict[str, int] = {}
 
+# ── 自动分批（2026-10-20 方案 B）─────────────────────────────────────────
+# 要解决的问题不是"页数太多"，而是"单批全量跑"这个形态：
+#   · 262 页 × 30s/页 ≈ 110 分钟的单进程，中途死一次（沙箱 TTL / OOM /
+#     网络）⇒ **一页都拿不到**，前功尽弃；
+#   · 一次渲染 262 页，内存峰值高；
+#   · 110 分钟里没有中间产物，进度只能靠 err.log 逐页行推断。
+# 分批后：每批独立进程，跑完即落盘到自己的目录，失败最多丢当前批；
+# 内存峰值按批封顶；进度天然可见（第 3/7 批）。
+#
+# ★ 分批 ≠ 截断：总页数**不设上限**，1000 页也是 25 批跑完，一页不少。
+#   任何"最多 N 页"的做法都是静默截断，是最差的一种降级（用户不知道被截）。
+#: 默认批大小（页）。40 页 × 30s ≈ 20 分钟/批，比单次 300s 的 MCP 读超时
+#: 长得多（必然跨调用），但短到"死一批只丢 20 分钟"。
+_OCR_BATCH_PAGES = 40
+#: batch_pages 参数上限。防止模型传 9999 把"分批"退化成"一次性全量"——
+#: 那正是本改动要消灭的形态。
+_OCR_BATCH_PAGES_MAX = 200
+#: 各批产物目录：batches/b001/{result.json,err.log,done.flag,result.txt,meta}
+_OCR_BATCH_DIR = "%s/batches" % _OCR_WORKDIR
+#: 分批状态（指纹 + 每批状态），沙箱内 JSON，跨调用持久化。
+#: ★ 必须落沙箱：MCP 进程是无状态的，每次工具调用都是新任务，
+#:   "上一批跑到哪"只能存在被操作的那一侧。
+_OCR_BATCH_STATE = "%s/state.json" % _OCR_BATCH_DIR
+
 
 def _bump_silent_streak(key: str) -> int:
     """记录并返回某指纹连续"零 stderr"的续查次数。"""
@@ -1348,6 +1372,273 @@ async def _ocr_task_age_seconds(sandbox_id: str, err_path: str) -> int:
         return -1
 
 
+async def _batch_state_load(
+    sandbox_id: str,
+    state_path: str,
+    fingerprint: str,
+    groups: list[list[int]],
+    batch_pages: int,
+    now: float,
+) -> tuple[dict, bool]:
+    """读分批状态；指纹不符或读不到 ⇒ 新建（返回 (state, 是否新建)）。
+
+    指纹含「源 PDF + dpi + 目标页集合 + 批大小」——任何一项变了都必须重开，
+    否则会把上一组参数的批次状态当成自己的进度（页范围错位 = 收错数据）。
+    """
+    raw = ""
+    rd = await _sandbox_read(sandbox_id, state_path)
+    if rd.get("success") and rd.get("data"):
+        raw = bytes(rd["data"]).decode("utf-8", errors="replace")
+    state = None
+    if raw.strip():
+        try:
+            cand = json.loads(raw)
+        except ValueError:
+            cand = None
+        if isinstance(cand, dict) and cand.get("fingerprint") == fingerprint:
+            batches = cand.get("batches")
+            if isinstance(batches, list) and len(batches) == len(groups):
+                state = cand
+    if state is None:
+        state = _batch_state_new(fingerprint, groups, batch_pages, now)
+        await _batch_state_save(sandbox_id, state_path, state)
+        logger.info(
+            "[OCR] 新建分批状态：%d 批 × 最多 %d 页（共 %d 页），指纹=%s",
+            state["batch_count"],
+            batch_pages,
+            sum(len(g) for g in groups),
+            fingerprint[:80],
+        )
+        return state, True
+    return state, False
+
+
+async def _batch_state_save(sandbox_id: str, state_path: str, state: dict) -> bool:
+    """写回分批状态。失败只告警不中断——状态丢失的后果是"进度重算"，
+    而中断的后果是整轮任务失败，前者可接受。"""
+    try:
+        payload = json.dumps(state, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError) as e:  # 理论上不会发生（全是基本类型）
+        logger.warning("[OCR] 分批状态序列化失败：%s", e)
+        return False
+    wr = await _sandbox_write(sandbox_id, state_path, payload)
+    if not wr.get("success"):
+        logger.warning("[OCR] 分批状态写回失败：%s", wr.get("error"))
+        return False
+    return True
+
+
+async def _batch_concat_texts(sandbox_id: str, out_txt: str, sources: list[str]) -> str | None:
+    """把各已完成批的 result.txt 按批序拼成一份全文（覆盖写）。
+
+    为什么不 append：续查/重跑会让同一批被收两次，append 会重复；按批序
+    重拼是幂等的（同一 state 重拼结果相同）。批次数 ≤ 页数/批大小，命令
+    长度安全（路径全是固定 ASCII）。
+    """
+    import shlex
+
+    if not sources:
+        return None
+    cmd = "cat %s > %s" % (
+        " ".join(shlex.quote(p) for p in sources),
+        shlex.quote(out_txt),
+    )
+    st = await _sandbox_run(sandbox_id, cmd, timeout=120)
+    if not st.get("success"):
+        logger.warning("[OCR] 合并批次文本失败：%s", (st.get("stderr") or "")[:200])
+        return None
+    return out_txt
+
+
+async def _ocr_batch_finish(
+    sandbox_id: str,
+    state: dict,
+    out_txt: str,
+    pdf_total_pages: int,
+    t0: float,
+    extra_warnings: list[str] | None = None,
+) -> dict:
+    """所有批次都跑完（含失败）时的收口：合并全文 + 汇总 + 显式列出失败批。
+
+    ★ 失败批次**不静默**：用户要的是"整本 262 页"，少一批就是少一段内容，
+      必须让模型（和它转述给用户的话）知道哪几段没跑出来、可以用
+      pages="41-80" 单独补跑。这比"返回全部成功"的假绿有用得多。
+    """
+    import time as _time
+
+    warnings = list(extra_warnings or [])
+    summary = _batch_summary(state)
+    batches = state.get("batches") or []
+    sources = [
+        "%s/b%03d/result.txt" % (_OCR_BATCH_DIR, int(b.get("idx") or 0))
+        for b in sorted(batches, key=lambda x: int(x.get("idx") or 0))
+        if str(b.get("status")) == "done"
+    ]
+    await _batch_concat_texts(sandbox_id, out_txt, sources)
+    warnings.append(
+        "分批结果：逐批结构化 JSON 在 %s/bNNN/result.json，全部文本已按批序合并到 %s"
+        % (_OCR_BATCH_DIR, out_txt)
+    )
+    for item in summary["batches_failed"]:
+        warnings.append(
+            "第 %s 批（第 %s 页）OCR 失败，这部分内容缺失：%s"
+            "——可用 pages=\"%s\" 单独重跑补齐"
+            % (
+                item["batch"],
+                item["pages"],
+                (item.get("error") or "未知原因")[:200],
+                item["pages"],
+            )
+        )
+    if summary["pages_ocred_doc"] < len(
+        [p for b in batches for p in (b.get("pages") or [])]
+    ):
+        # 只提示不阻断：已跑出来的部分仍然可用（这正是分批的价值）
+        logger.warning(
+            "[OCR] 分批收口但页数不完整：已 OCR %d 页 / 计划 %d 页",
+            summary["pages_ocred_doc"],
+            len([p for b in batches for p in (b.get("pages") or [])]),
+        )
+    preview_st = await _sandbox_run(
+        sandbox_id, "head -c %d %s 2>/dev/null" % (_OCR_PREVIEW_CHARS, shlex.quote(out_txt)),
+        timeout=60,
+    )
+    preview = (preview_st.get("stdout") or "")[:_OCR_PREVIEW_CHARS]
+    total = summary["pages_ocred_doc"]
+    return {
+        "success": total > 0,
+        "step": None if total > 0 else "batch",
+        "error": None if total > 0 else "所有批次均未产出文本（见 warnings）",
+        "status": "completed",
+        "batch": "%d/%d" % (summary["batches_done"], state.get("batch_count") or 0),
+        "batch_count": state.get("batch_count") or 0,
+        "batches_done": summary["batches_done"],
+        "batches_failed": summary["batches_failed"],
+        # 分批模式下 pages_* 仍是"本批/文档"两套口径，收口时两者相等
+        "pages_total": len([p for b in batches for p in (b.get("pages") or [])]),
+        "pdf_total_pages": pdf_total_pages,
+        "pages_ocred": total,
+        "pages_ocred_total": len([p for b in batches for p in (b.get("pages") or [])]),
+        "pages_ocred_doc": total,
+        "pages_failed": sum(int(b.get("failed") or 0) for b in batches),
+        "total_texts": summary["total_texts_doc"],
+        "elapsed_sec": round(_time.time() - t0, 1),
+        "payload_json": None,  # 分批：每批一份，见 warnings 里的目录说明
+        "payload_txt": out_txt,
+        "sandbox_path": "",
+        "sandbox_dir": _OCR_WORKDIR,
+        "preview": preview,
+        "warnings": warnings,
+    }
+
+
+async def _ocr_batch_settle(
+    sandbox_id: str,
+    state: dict,
+    state_path: str,
+    batch_idx: int,
+    res: dict,
+    pdf_total_pages: int,
+    t0: float,
+    out_txt: str,
+) -> dict:
+    """收完当前批次后结算：标状态 → 保存 → 决定"返回 running 推进下一批"还是"全部收口"。
+
+    两种结果都从同一处出，避免"完成一批就返回 completed"把后续批次丢掉
+    （那会变成静默截断——本改动要消灭的正是这个）。
+    """
+    import time as _time
+
+    batches = state.get("batches") or []
+    cur = batches[batch_idx]
+    ok = res.get("status") == "completed"
+    if ok:
+        cur["status"] = "done"
+        cur["ocred"] = int(res.get("pages_ocred") or 0)
+        cur["failed"] = int(res.get("pages_failed") or 0)
+        cur["texts"] = int(res.get("total_texts") or 0)
+        cur["error"] = None
+        logger.info(
+            "[OCR] 第 %d/%d 批完成（%s，%d 页 / %d 条文本）",
+            cur["idx"],
+            state.get("batch_count") or 0,
+            _page_span_text(cur.get("pages") or []),
+            cur["ocred"],
+            cur["texts"],
+        )
+    else:
+        cur["status"] = "failed"
+        cur["error"] = str(res.get("error") or res.get("step") or "未知错误")[:300]
+        logger.warning(
+            "[OCR] 第 %d/%d 批失败（%s）：%s",
+            cur["idx"],
+            state.get("batch_count") or 0,
+            _page_span_text(cur.get("pages") or []),
+            cur["error"],
+        )
+    state["updated_at"] = _time.time()
+    await _batch_state_save(sandbox_id, state_path, state)
+
+    total = state.get("batch_count") or 0
+    nxt = _batch_current_index(state)
+    if nxt is None:
+        return await _ocr_batch_finish(
+            sandbox_id, state, out_txt, pdf_total_pages, t0
+        )
+    nxt_batch = batches[nxt]
+    nxt_span = _page_span_text(nxt_batch.get("pages") or [])
+    summary = _batch_summary(state)
+    warnings = list(res.get("warnings") or [])
+    if not ok:
+        warnings.append(
+            "第 %s 批（第 %s 页）失败，已跳过继续后续批次：%s"
+            % (cur["idx"], _page_span_text(cur.get("pages") or []), cur["error"])
+        )
+    return {
+        "success": True,
+        "step": None,
+        "error": None,
+        "status": "running",
+        # 分批进度：batch 指"当前要处理的那一批"
+        "batch": "%d/%d" % (nxt_batch.get("idx") or 0, total),
+        "batch_index": nxt_batch.get("idx") or 0,
+        "batch_count": total,
+        "batch_pages": nxt_span,
+        "next_batch": nxt_span,
+        "batches_done": summary["batches_done"],
+        "batches_failed": summary["batches_failed"],
+        "pages_total": len(nxt_batch.get("pages") or []),
+        "pdf_total_pages": pdf_total_pages,
+        "pages_ocred": 0,
+        "pages_ocred_total": len(nxt_batch.get("pages") or []),
+        "pages_ocred_doc": summary["pages_ocred_doc"],
+        "pages_failed": 0,
+        "total_texts": summary["total_texts_doc"],
+        "elapsed_sec": round(_time.time() - t0, 1),
+        "payload_json": None,
+        "payload_txt": None,
+        "sandbox_path": "",
+        "sandbox_dir": _OCR_WORKDIR,
+        "preview": "",
+        "warnings": warnings,
+        "progress_hint": (
+            "分批 OCR：已完成 %d/%d 批（累计 %d/%d 页）。"
+            "第 %s 批（第 %s 页）现在**尚未启动**——请用完全相同的参数"
+            "（含 pages/batch_pages/dpi）再调一次本工具，会自动启动并推进它。"
+            "**不要重新上传、不要改用 execute 自己写脚本、不要换 pages**。"
+            "每批完成的结果已落盘，中途失败只影响当前批。"
+            % (
+                summary["batches_done"],
+                total,
+                summary["pages_ocred_doc"],
+                pdf_total_pages,
+                nxt_batch.get("idx") or 0,
+                nxt_span,
+            )
+        ),
+    }
+
+
 def _parse_page_spec(spec: str, page_count: int) -> tuple[list[int] | None, str | None]:
     """把 "all" / "1-5" / "3,7,9" / "12" 解析为 0-based 页下标（去重升序）。
 
@@ -1387,6 +1678,107 @@ def _parse_page_spec(spec: str, page_count: int) -> tuple[list[int] | None, str 
     if not picked:
         return None, "页选择为空"
     return sorted(picked), None
+
+
+def _page_span_text(pages_1based: list[int], limit: int = 6) -> str:
+    """把 1-based 页号列表压成人类可读文本："81-120" / "1-3,7,9"。
+
+    连续段折叠成区间（分批后的每批都是连续段 ⇒ 恒为 "a-b"）；非连续段
+    超过 ``limit`` 个时折叠成 "a-b,c-d 等 N 页"，避免把 262 个页号糊进提示里。
+    纯函数，不碰 IO。
+    """
+    nums = sorted({int(p) for p in pages_1based})
+    if not nums:
+        return "空"
+    segs: list[tuple[int, int]] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        segs.append((start, prev))
+        start = prev = n
+    segs.append((start, prev))
+    parts = [("%d" % a) if a == b else ("%d-%d" % (a, b)) for a, b in segs]
+    if len(parts) > limit:
+        return "%s 等 %d 页" % (",".join(parts[:limit]), len(nums))
+    return ",".join(parts)
+
+
+def _plan_ocr_batches(target_pages: list[int], batch_pages: int) -> list[list[int]]:
+    """把目标页下标（0-based，升序）切成连续批次，每批至多 batch_pages 页。
+
+    ★ 这里**不设总页数上限**：切多少批由页数决定（1000 页 = 25 批），
+      一页都不会被丢掉。分批的目的是"失败只丢当前批"和"内存按批封顶"，
+      不是"少干点活"。
+    batch_pages<=0 ⇒ 不分批（返回单批）。
+    """
+    if batch_pages <= 0 or not target_pages:
+        return [list(target_pages)]
+    return [target_pages[i:i + batch_pages] for i in range(0, len(target_pages), batch_pages)]
+
+
+def _batch_state_new(
+    fingerprint: str, groups: list[list[int]], batch_pages: int, created_at: float
+) -> dict:
+    """新建分批状态。每批记 pages（1-based，便于人读/回显）与状态机字段。
+
+    状态取值：pending（待跑）| running（已启动）| done（成功收产物）
+              | failed（进程非 0 退出 / 产物不可读，不自动重试）
+    """
+    return {
+        "fingerprint": fingerprint,
+        "batch_pages": int(batch_pages),
+        "batch_count": len(groups),
+        "created_at": created_at,
+        "updated_at": created_at,
+        "batches": [
+            {
+                "idx": i + 1,
+                "pages": [int(p) + 1 for p in grp],
+                "status": "pending",
+                "ocred": 0,
+                "failed": 0,
+                "texts": 0,
+                "error": None,
+            }
+            for i, grp in enumerate(groups)
+        ],
+    }
+
+
+def _batch_current_index(state: dict) -> int | None:
+    """下一个要处理的批次下标（0-based）；全部结束返回 None。
+
+    优先 pending，也接管 running（上次调用启动后 MCP 侧没有机会更新——
+    进程可能仍在跑，由下游的判活闸门决定"续等"还是"重启"，不在这里猜）。
+    失败的批次**不自动重试**：坏 PDF 会让它无限重试，而模型可以用
+    pages="41-80" 显式重跑那一段。
+    """
+    for i, b in enumerate(state.get("batches") or []):
+        if str(b.get("status")) in ("pending", "running"):
+            return i
+    return None
+
+
+def _batch_summary(state: dict) -> dict:
+    """已跑批次汇总：完成/失败批次、文档级已完成页数、累计文本条数。"""
+    batches = state.get("batches") or []
+    done = [b for b in batches if str(b.get("status")) == "done"]
+    failed = [b for b in batches if str(b.get("status")) == "failed"]
+    return {
+        "batches_done": len(done),
+        "batches_failed": [
+            {
+                "batch": b.get("idx"),
+                "pages": _page_span_text(b.get("pages") or []),
+                "error": b.get("error"),
+            }
+            for b in failed
+        ],
+        "pages_ocred_doc": sum(int(b.get("ocred") or 0) for b in done),
+        "total_texts_doc": sum(int(b.get("texts") or 0) for b in done),
+    }
 
 
 def _first_json_value(raw: str):
@@ -1431,6 +1823,7 @@ async def ocr_pdf_to_text(
     dpi: int = 150,
     sandbox_pdf_path: str | None = None,
     wait_seconds: int = 90,
+    batch_pages: int = 0,
 ) -> dict:
     """对扫描件/图片型 PDF 做 OCR 并返回文本。**这是本环境唯一的 OCR 入口。**
 
@@ -1445,10 +1838,18 @@ async def ocr_pdf_to_text(
 
     **执行模型（2026-10-19 改，submit-and-poll）**：OCR 在沙箱内后台运行，
     本工具最多等待 wait_seconds 秒。未完成时返回 status="running"（带进度提示），
-    **用完全相同的参数（file_path/sandbox_id/pages/dpi/sandbox_pdf_path）再调一次
-    即可续查或取回结果，不会重复上传、不会重复 OCR**（沙箱内按参数指纹复用）。
-    大文档推荐分批：pages="1-20" → "21-40" …，单批 20 页约 10 分钟（150dpi 实测
-    30s/页），每批一次调用，避免单次任务跑几十分钟。
+    **用完全相同的参数（file_path/sandbox_id/pages/dpi/sandbox_pdf_path/batch_pages）
+    再调一次即可续查或取回结果，不会重复上传、不会重复 OCR**（沙箱内按参数指纹复用）。
+
+    **自动分批（2026-10-20 起）**：目标页数超过 batch_pages（默认 40）时，本工具
+    自动切成多批，**每批独立进程、跑完即落盘**，一次调用推进一批。返回里
+    `batch: "3/7"` 表示当前第 3 批 / 共 7 批，`pages_ocred_doc` 是整本文档累计
+    已 OCR 页数。看到 `status="running"` 且 `batch` 未到末批时，**同样参数再调一次**
+    即可推进下一批——不要重新上传、不要换 pages、不要自己写脚本重跑。
+    - 总页数**不设上限**：分批不是截断，262 页 = 7 批全部跑完，一页不少；
+    - 某一批失败不影响其它批（失败批会在 `batches_failed` 里列出，可用
+      `pages="41-80"` 单独补跑那一段）；
+    - pages="all" 与 pages="1-262" 走同一套分批路径。
 
     Args:
         file_path: 虚拟路径（/uploads/{user_id}/{session_id}/{filename}）或
@@ -1456,24 +1857,32 @@ async def ocr_pdf_to_text(
             **与 sandbox_pdf_path 二选一即可**——PDF 已在沙箱里时只给
             sandbox_pdf_path，不给本参数。
         sandbox_id: 目标沙箱 ID（用当前会话的沙箱）。
-        pages: 页选择。"20"（默认，前 20 页）| "all"（全量，慎用）| "1-5" |
-            "3,7,9" | "12"。**实测速度约 30s/页（150dpi、4 vCPU）**——262 页
-            全量约 110 分钟，抽 20 页约 10 分钟。只关心部分页时务必指定。
+        pages: 页选择。"20"（默认，前 20 页）| "all"（全量，自动分批）| "1-5" |
+            "3,7,9" | "12"。**实测速度约 30s/页（150dpi、4 vCPU）**。
+            只关心部分页时可以显式指定，会比 all 少跑很多批。
         dpi: PDF 渲染 DPI，100~200，默认 150。超过 200 在 8GB 沙箱上有 OOM 风险。
         sandbox_pdf_path: 可选。若 PDF 已经在沙箱里（之前上传过），直接给沙箱路径，
             省掉一次上传（大文件可省几十秒）。
         wait_seconds: 单次调用最长等待秒数，0~300，默认 90。超时未完成则返回
             status="running"，按上面说明用相同参数再调。
+        batch_pages: 每批页数，0 = 自动（默认 40，上限 200）。一般不用传；
+            页数特别多的文档想减小单批内存占用时可设小一点（如 20）。
 
     Returns:
         {"success": bool, "step": str|None, "error": str|None,
          "status": "completed"|"running",
-         "pages_total": int, "pages_ocred": int, "pages_failed": int,
+         "pages_total": int,        # 本批要 OCR 的页数
+         "pdf_total_pages": int,    # 文档总页数
+         "pages_ocred": int, "pages_failed": int,
          "total_texts": int, "elapsed_sec": float,
          "payload_json": str,   # 沙箱内逐页结构化结果（page/texts/scores）
          "payload_txt": str,    # 沙箱内纯文本，带 "===== page N =====" 分隔
          "preview": str,        # 前 2000 字符，够判断内容对不对
-         "warnings": [str]}
+         "warnings": [str],
+         # 分批模式额外字段：
+         "batch": "3/7", "batch_count": int, "batch_pages": "81-120",
+         "batches_done": int, "batches_failed": [{batch,pages,error}],
+         "pages_ocred_doc": int}  # 整本文档累计已 OCR 页数
         status="running" 时另带 progress_hint（str）说明如何续查。
         全文不会放进返回值（262 页会直接撑爆上下文）：需要细节时用 read_file
         读 payload_txt，或按页再调一次本工具（pages="10-20"）。
@@ -1578,13 +1987,69 @@ async def ocr_pdf_to_text(
     if perr:
         return _fail("validate", perr)
 
+    # ── S3b：分批规划（方案 B，2026-10-20）──
+    # 目标页集合（0-based 升序）。pages="all" ⇒ range(page_count)，
+    # 于是 "all" 与 "1-262" 走**完全相同**的分批路径（不搞两套语义）。
+    #
+    # 分批只在"目标页数 > 批大小"时启用：小文档/小页范围仍是原来的单批路径，
+    # 行为零变化（所有既有 e2e/单测都覆盖这条路，避免无谓回归）。
+    target_pages = list(range(page_count)) if want is None else list(want)
+    batch_pages = int(batch_pages or 0)
+    if batch_pages <= 0:
+        batch_pages = _OCR_BATCH_PAGES
+    batch_pages = max(1, min(batch_pages, _OCR_BATCH_PAGES_MAX))
+    batching = len(target_pages) > batch_pages
+
+    batch_state: dict | None = None
+    batch_idx: int | None = None
+    batch_dir = ""
+    # 当前（批）产物文本 vs 整本合并文本：分批时前者落到批目录，
+    # 后者是所有已完成批按序拼接的结果（_ocr_batch_finish 里重拼，幂等）。
+    out_txt = "%s/result.txt" % _OCR_WORKDIR
+    out_txt_all = "%s/result.txt" % _OCR_WORKDIR
+    if batching:
+        batch_groups = _plan_ocr_batches(target_pages, batch_pages)
+        # 文档级指纹：源 PDF + dpi + 批大小 + 目标页集合。任一不同都是新任务，
+        # 必须重开分批状态（否则会拿上一组参数的批次进度当自己的）。
+        doc_fp = "%s|dpi=%d|batch=%d|pages=%s" % (
+            src_pdf,
+            int(dpi),
+            batch_pages,
+            _page_span_text([p + 1 for p in target_pages], limit=10 ** 6),
+        )
+        batch_state, _fresh = await _batch_state_load(
+            sandbox_id, _OCR_BATCH_STATE, doc_fp, batch_groups, batch_pages, _time.time()
+        )
+        batch_idx = _batch_current_index(batch_state)
+        if batch_idx is None:
+            # 全部批次已结束（成功或失败）⇒ 不再启动任何进程，直接收口。
+            # ★ 这里绝不能返回 completed 就跑：失败的批次要显式列出来。
+            return await _ocr_batch_finish(
+                sandbox_id, batch_state, out_txt_all, page_count, t0
+            )
+        # 切换成"只处理当前批"：want 变成该批页下标，所有产物路径落到批目录。
+        # 下游（指纹复用/判活/启动/轮询/收产物）**一行不用改**——这是本方案
+        # 能把改造面压到最小的关键。
+        want = list(batch_groups[batch_idx])
+        cur_batch = batch_state["batches"][batch_idx]
+        batch_dir = "%s/b%03d" % (_OCR_BATCH_DIR, batch_idx + 1)
+        out_txt = "%s/result.txt" % batch_dir
+        if str(cur_batch.get("status")) != "running":
+            cur_batch["status"] = "running"
+            batch_state["updated_at"] = _time.time()
+            await _batch_state_save(sandbox_id, _OCR_BATCH_STATE, batch_state)
+
     target_pdf = src_pdf
     if want is not None:
-        sub = src_pdf + ".sub.pdf"
+        sub = ("%s/input.sub.pdf" % batch_dir) if batching else (src_pdf + ".sub.pdf")
         sp = await _sandbox_run(
             sandbox_id,
-            "python3 %s %s %s" % (
-                shlex.quote(helper), shlex.quote(src_pdf), " ".join(str(i) for i in want)
+            "mkdir -p %s; python3 %s %s %s"
+            % (
+                shlex.quote(batch_dir or _OCR_WORKDIR),
+                shlex.quote(helper),
+                shlex.quote(src_pdf),
+                " ".join(str(i) for i in want),
             ),
             timeout=600,
         )
@@ -1606,15 +2071,30 @@ async def ocr_pdf_to_text(
     #      镜像里也没装。文件系统才是跨 namespace 的可靠信号源；
     #   4) 相同指纹的后续调用直接复用已有结果，不重跑。
     # 参照 deer-flow mcp/tasks/ 的 McpTaskDriver 状态机（简化版）。
-    out_json = "%s/result.json" % _OCR_WORKDIR
-    out_err = "%s/err.log" % _OCR_WORKDIR
-    out_done = "%s/done.flag" % _OCR_WORKDIR
-    out_meta = "%s/ocr.meta" % _OCR_WORKDIR
+    if batching:
+        # 每批自己的产物目录：失败/重启只影响当前批，前序批次已落盘的产物
+        # 不会被清场删掉（这正是"失败只丢当前批"的落地方式）。
+        out_json = "%s/result.json" % batch_dir
+        out_err = "%s/err.log" % batch_dir
+        out_done = "%s/done.flag" % batch_dir
+        out_meta = "%s/ocr.meta" % batch_dir
+    else:
+        out_json = "%s/result.json" % _OCR_WORKDIR
+        out_err = "%s/err.log" % _OCR_WORKDIR
+        out_done = "%s/done.flag" % _OCR_WORKDIR
+        out_meta = "%s/ocr.meta" % _OCR_WORKDIR
     n_pages = page_count if want is None else len(want)
 
     # 指纹：src_pdf + pages + dpi 全同才允许复用（pages 不同必须重跑，
     # 否则会读到上一次页范围的产物——语义错误比浪费更严重）。
+    # 分批模式追加批次号 + 本批页范围：同一份文档的不同批次之间也必须互相
+    # 隔离，否则第 3 批的调用会命中第 2 批留下的 done.flag 直接收错页范围。
     fingerprint = "%s|%s|%s" % (src_pdf, str(pages), int(dpi))
+    if batching:
+        fingerprint += "|b%03d|p%s" % (
+            (batch_idx or 0) + 1,
+            _page_span_text([p + 1 for p in (want or [])], limit=10 ** 6),
+        )
 
     async def _poll_done() -> str | None:
         """done.flag 的内容（退出码字符串）；不存在返回 None（仍在跑）。"""
@@ -1655,6 +2135,24 @@ async def ocr_pdf_to_text(
         text = (st.get("stdout") or "").strip()
         return text or None
 
+    async def _settle(warnings_list: list[str]) -> dict:
+        """收当前（批）产物；分批模式还要结算批次状态并决定下一步。
+
+        ★ 为什么三条收产物路径都走这里：不抽出来的话"指纹复用"分支会直接
+          返回 completed，把后面的批次全丢掉——那正是静默截断，本改动要
+          消灭的东西。收产物必须在**一处**收口，才不会漏掉批次推进。
+        """
+        res = await _ocr_collect(
+            sandbox_id, out_json, out_err, page_count, want, pages, dpi,
+            t0, warnings_list, n_pages, target_pdf, out_txt=out_txt,
+        )
+        if batch_state is None or batch_idx is None:
+            return res
+        return await _ocr_batch_settle(
+            sandbox_id, batch_state, _OCR_BATCH_STATE, batch_idx, res,
+            page_count, t0, out_txt_all,
+        )
+
     # ── 4a. 指纹一致性判定 + 幂等续查 / 启动 ──
     # ★ 指纹判定必须先于 done.flag 分支：完成信号是上一次（不同参数组合）
     #   任务留下时，其 result.json 对本次无效——直接收会读到别的页范围的
@@ -1694,10 +2192,7 @@ async def ocr_pdf_to_text(
                         "复用沙箱内已有 OCR 结果（参数指纹一致，未重跑）"
                     ]
                     _OCR_SILENT_STREAK.pop("%s|%s" % (sandbox_id, fingerprint), None)
-                    return await _ocr_collect(
-                        sandbox_id, out_json, out_err, page_count, want, pages, dpi,
-                        t0, warnings0, n_pages, target_pdf,
-                    )
+                    return await _settle(warnings0)
                 should_launch = True
         else:
             should_launch = True
@@ -1724,7 +2219,9 @@ async def ocr_pdf_to_text(
             sandbox_id,
             "mkdir -p %s; rm -f %s %s %s"
             % (
-                shlex.quote(_OCR_WORKDIR),
+                # 分批时清场只清**本批目录**：前面批次的产物必须留着，
+                # 否则"失败只丢当前批"就变成"每批都丢前面所有批"。
+                shlex.quote(batch_dir or _OCR_WORKDIR),
                 shlex.quote(out_json),
                 shlex.quote(out_err),
                 shlex.quote(out_done),
@@ -1856,7 +2353,7 @@ async def ocr_pdf_to_text(
                 )
                 if streak >= 2:
                     stage += "——建议按失败处理，用 execute 检查 err.log 与进程状态"
-            return {
+            running_payload = {
                 "success": True,
                 "step": None,
                 "error": None,
@@ -1894,6 +2391,44 @@ async def ocr_pdf_to_text(
                     )
                 ),
             }
+            if batch_state is not None and batch_idx is not None:
+                # 分批：把"第几批 / 整本累计"补上去。模型据此能算出还剩多少，
+                # 而不是只看到一个恒定的本批 0/40 以为卡死。
+                bsum = _batch_summary(batch_state)
+                cur_b = batch_state["batches"][batch_idx]
+                running_payload.update({
+                    "batch": "%d/%d" % (cur_b.get("idx") or 0,
+                                        batch_state.get("batch_count") or 0),
+                    "batch_index": cur_b.get("idx") or 0,
+                    "batch_count": batch_state.get("batch_count") or 0,
+                    "batch_pages": _page_span_text(cur_b.get("pages") or []),
+                    "batches_done": bsum["batches_done"],
+                    "batches_failed": bsum["batches_failed"],
+                    "pages_ocred_doc": bsum["pages_ocred_doc"] + ocred,
+                })
+                running_payload["progress_hint"] = (
+                    "分批 OCR：第 %s/%s 批（第 %s 页）正在后台运行；"
+                    "本批已处理 %d/%d 页，整本累计 %d/%d 页。%s。"
+                    "请用**完全相同的参数**（含 pages/batch_pages/dpi）再调一次本工具"
+                    "续查；本批完成后会自动结算并给出下一批。"
+                    "PDF 在沙箱内 %s，**不要重新上传、不要换 pages、"
+                    "不要改用 execute 自己写脚本重跑**——"
+                    "已完成批次的结果已落盘，重启只会重跑当前批。"
+                    "150dpi 实测约 30s/页；err.log 尾部：%s"
+                    % (
+                        cur_b.get("idx") or 0,
+                        batch_state.get("batch_count") or 0,
+                        _page_span_text(cur_b.get("pages") or []),
+                        ocred,
+                        n_pages,
+                        bsum["pages_ocred_doc"] + ocred,
+                        page_count,
+                        stage,
+                        target_pdf,
+                        err_tail.splitlines()[-1][:200] if err_tail else "(空)",
+                    )
+                )
+            return running_payload
         await _asyncio.sleep(_OCR_POLL_INTERVAL)
         done_code = await _poll_done()
 
@@ -1920,10 +2455,7 @@ async def ocr_pdf_to_text(
         warnings.append(
             "OCR 执行失败（exit=%d）：%s" % (exit_code, (tail.get("stdout") or "").strip()[:300])
         )
-    return await _ocr_collect(
-        sandbox_id, out_json, out_err, page_count, want, pages, dpi,
-        t0, warnings, n_pages, target_pdf,
-    )
+    return await _settle(warnings)
 
 
 async def _ocr_collect(
@@ -1938,11 +2470,16 @@ async def _ocr_collect(
     warnings: list[str],
     n_pages: int,
     sandbox_path: str = "",
+    out_txt: str = "",
 ) -> dict:
     """S5：读回 result.json，拼纯文本，只回摘要 + 预览。
 
     从 ocr_pdf_to_text 抽出——submit-and-poll 改造后有三条路径汇到此处
     （轮询等到完成 / 指纹复用 / 续查时进程已结束），收集逻辑只写一份。
+
+    ``out_txt``：纯文本落地路径。分批模式下由调用方传"批目录/result.txt"，
+    这样每批的文本各自独立（后续由 _ocr_batch_finish 按批序重拼全文），
+    否则第 3 批会把第 2 批的文本覆盖掉。默认沿用根路径（单批路径不变）。
     """
     import shlex
     import time as _time
@@ -1992,7 +2529,7 @@ async def _ocr_collect(
         chunks.append("\n".join(str(t) for t in texts) if texts else "(无文本)")
         chunks.append("")
     body = "\n".join(chunks)
-    out_txt = "%s/result.txt" % _OCR_WORKDIR
+    out_txt = out_txt or ("%s/result.txt" % _OCR_WORKDIR)
     tw = await _sandbox_write(sandbox_id, out_txt, body.encode("utf-8"))
     if not tw["success"]:
         warnings.append("纯文本回写失败：%s" % tw.get("error"))
