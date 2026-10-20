@@ -389,7 +389,7 @@ def _load_ocr_module():
     src = _src()
     tree = ast.parse(src)
     want_names = {"ocr_pdf_to_text", "_ocr_collect", "_fail", "_parse_page_spec",
-                  "_first_json_value", "_parse_ocr_progress"}
+                  "_first_json_value", "_parse_ocr_progress", "_ocr_task_age_seconds"}
     body = [n for n in tree.body
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in want_names]
     assert len(body) == len(want_names), "依赖函数不全：%s" % [n.name for n in body]
@@ -410,7 +410,14 @@ def _load_ocr_module():
                     consts[tgt.id] = ast.literal_eval(val)
                 except (ValueError, SyntaxError):
                     pass  # _OCR_HELPER_PY 等 literal_eval 吃不下就跳过
-    ns = {"json": json, "os": __import__("os"), "re": __import__("re"), **consts}
+    ns = {"json": json, "os": __import__("os"), "re": __import__("re"),
+          # logger 桩：被测函数只做日志输出，不能因缺名而崩
+          "logger": types.SimpleNamespace(
+              info=lambda *a, **k: None,
+              warning=lambda *a, **k: None,
+              error=lambda *a, **k: None,
+          ),
+          **consts}
     # 派生常量（`"%s/ocr_run.py" % _OCR_WORKDIR` 这类 BinOp，literal_eval 吃不下）
     # 用与 main.py 相同的表达式补，避免测试常量与生产脱钩。
     workdir = ns.get("_OCR_WORKDIR", "/home/user/_ocr")
@@ -794,3 +801,194 @@ def test_ensure_ocr_runner_writes_repo_payload():
     assert r["version"].startswith("1.2"), "下发版本应 >= 1.2.0（带逐页进度），实际 %r" % r["version"]
     assert captured["path"] == "/home/user/_ocr/ocr_run.py"
     assert captured["data"] == RUNNER_PY.read_bytes(), "下发字节与仓库文件不一致"
+
+
+class _ResumeSandbox:
+    """续查现场（add0229b 的真实形态）：meta 已是本次指纹、done.flag 没有、
+    result.json 被 shell 重定向创建成 0 字节，err.log 仍在增长（任务在跑）。
+
+    age 控制 mtime 距今秒数：<= _OCR_LIVENESS_SEC 表示在跑；-1 表示没有 err.log。
+    """
+
+    def __init__(self, age: int, err_text: str = "", result_nonempty: bool = False):
+        self.age = age
+        self.err_text = err_text
+        self.result_nonempty = result_nonempty
+        self.commands: list[str] = []
+
+    async def run(self, sandbox_id, cmd, timeout=None):
+        self.commands.append(cmd)
+        if cmd.startswith("test -f /home/user/_ocr/e2e.pdf"):
+            return {"success": True, "stdout": "OK\n", "stderr": ""}
+        if "grep -m1" in cmd:
+            return {"success": True, "stdout": '__version__ = "1.1.0"\nOK\n', "stderr": ""}
+        if cmd.endswith("_page.py /home/user/_ocr/e2e.pdf"):
+            return {"success": True, "stdout": "20\n", "stderr": ""}
+        if "stat -c %Y" in cmd:  # 判活探针
+            return {"success": True, "stdout": "AGE=%d\n" % self.age, "stderr": ""}
+        if cmd.startswith("test -s") and cmd.endswith("result.json && echo OK"):
+            return {"success": True, "stdout": ("OK\n" if self.result_nonempty else ""), "stderr": ""}
+        if "nohup bash -c" in cmd:
+            return {"success": True, "stdout": "BG_STARTED\n", "stderr": ""}
+        if cmd.startswith("tail -n"):
+            return {"success": True, "stdout": self.err_text, "stderr": ""}
+        return {"success": True, "stdout": "", "stderr": ""}
+
+    async def write(self, sandbox_id, path, data):
+        return {"success": True, "error": None}
+
+    async def read(self, sandbox_id, path):
+        return {"success": False, "data": b"", "error": "not found"}
+
+
+def _resume_ns(sb):
+    ns = _load_ocr_module()
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+    ns["_upload_precheck"] = None
+    ns["_resolve_host_path"] = None
+    # meta 预置为本次指纹（src=沙箱路径, pages=all, dpi=150）
+    ns["_read_fingerprint_stub"] = None
+    return ns
+
+
+def test_inflight_task_is_not_restarted_on_resume():
+    """同指纹任务仍在推进时，续查**不得重启**（否则 unlink 正在写的产物）。
+
+    add0229b 的续查形态：模型每 ~300s 用完全相同的参数再调一次。
+    旧实现只看 result.json 是否存在——而 `python3 ... > result.json` 在启动
+    瞬间就创建了 0 字节文件，于是"正在跑"被判成"有产物"，要么复用空文件
+    报 read 失败，要么清场重启把正在写的 inode unlink 掉、结果全丢。
+    正确判据：err.log 的 mtime 新鲜 ⇒ 在跑 ⇒ 不清场、不启动、直接续等。
+    """
+    import asyncio as _asyncio
+
+    err = "\n".join([
+        "[ocr_run] ocr start pages=20",
+        "[ocr_run] page 12/20 ok texts=40 elapsed=28.1s",
+    ])
+    sb = _ResumeSandbox(age=12, err_text=err)
+
+    async def _run():
+        ns = _resume_ns(sb)
+        # 让 _read_fingerprint 返回与本次一致的指纹
+        orig_poll = sb.run
+
+        async def _patched(sandbox_id, cmd, timeout=None):
+            if cmd.startswith("cat ") and "ocr.meta" in cmd:
+                return {"success": True,
+                        "stdout": "/home/user/_ocr/e2e.pdf|all|150\n", "stderr": ""}
+            return await orig_poll(sandbox_id, cmd, timeout)
+
+        ns["_sandbox_run"] = _patched
+        return await ns["ocr_pdf_to_text"](
+            sandbox_id="sbx-test",
+            sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+            pages="all",
+            dpi=150,
+            wait_seconds=0,
+        )
+
+    r = _asyncio.run(_run())
+    assert not any("nohup bash -c" in c for c in sb.commands), (
+        "任务在跑时不得重新启动（会 unlink 正在写入的 result.json）"
+    )
+    assert r["status"] == "running", r
+    assert r["pages_ocred"] == 12, "续查必须给出真实进度，实际：%s" % r.get("pages_ocred")
+
+
+def test_empty_result_json_is_not_reused():
+    """result.json 存在但为空（任务在跑/被杀）时不得当成"已有产物"复用。"""
+    import asyncio as _asyncio
+
+    sb = _ResumeSandbox(age=-1, result_nonempty=False)
+
+    async def _run():
+        ns = _resume_ns(sb)
+        orig_poll = sb.run
+
+        async def _patched(sandbox_id, cmd, timeout=None):
+            if cmd.startswith("cat ") and "ocr.meta" in cmd:
+                return {"success": True,
+                        "stdout": "/home/user/_ocr/e2e.pdf|all|150\n", "stderr": ""}
+            return await orig_poll(sandbox_id, cmd, timeout)
+
+        ns["_sandbox_run"] = _patched
+        return await ns["ocr_pdf_to_text"](
+            sandbox_id="sbx-test",
+            sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+            pages="all",
+            dpi=150,
+            wait_seconds=0,
+        )
+
+    r = _asyncio.run(_run())
+    assert any("nohup bash -c" in c for c in sb.commands), (
+        "err.log 无活动且 result.json 为空 ⇒ 必须重新启动任务"
+    )
+    assert r["status"] == "running", r
+
+
+def test_stale_errlog_allows_restart():
+    """err.log 陈旧（SIGKILL 残留）超过判活窗口 ⇒ 允许重启。
+
+    否则 OOM 被杀的进程会留下 err.log，让任务永远显示"在跑"，再也重启不了。
+    """
+    import asyncio as _asyncio
+
+    sb = _ResumeSandbox(age=9999, err_text="[ocr_run] ocr start pages=20")
+
+    async def _run():
+        ns = _resume_ns(sb)
+        orig_poll = sb.run
+
+        async def _patched(sandbox_id, cmd, timeout=None):
+            if cmd.startswith("cat ") and "ocr.meta" in cmd:
+                return {"success": True,
+                        "stdout": "/home/user/_ocr/e2e.pdf|all|150\n", "stderr": ""}
+            return await orig_poll(sandbox_id, cmd, timeout)
+
+        ns["_sandbox_run"] = _patched
+        return await ns["ocr_pdf_to_text"](
+            sandbox_id="sbx-test",
+            sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+            pages="all",
+            dpi=150,
+            wait_seconds=0,
+        )
+
+    _asyncio.run(_run())
+    assert any("nohup bash -c" in c for c in sb.commands), "陈旧 err.log 必须允许重启"
+
+
+def test_result_reuse_requires_nonempty_file():
+    """复用判定必须 `test -s`（非空），不能 `test -f`。
+
+    `python3 ... > result.json` 在命令启动瞬间就创建了 0 字节文件，用
+    `test -f` 会把"正在跑"误判成"有产物"⇒ 复用空文件 ⇒ _fail("read")
+    （2026-10-20 e2e T2/T3 实锤：T1 用 wait_seconds=5 提前返回后 T2 立刻续查）。
+    """
+    src = _src()
+    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "ocr_pdf_to_text")))
+    assert "test -s %s && echo OK" in seg, "复用判定必须用 test -s（非空文件）"
+    assert 'test -f %s && echo OK" % shlex.quote(out_json)' not in seg, (
+        "不得用 test -f 判 result.json——空文件也会通过，把进行中的任务当成已完成"
+    )
+
+
+def test_liveness_gate_precedes_restart():
+    """判活闸门必须存在且先于启动：err.log mtime 新鲜 ⇒ 不重启。
+
+    否则续查会清场重启，把正在写的 result.json unlink 掉（结果全丢）。
+    """
+    src = _src()
+    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "ocr_pdf_to_text")))
+    assert "_ocr_task_age_seconds" in seg, "缺少 mtime 判活探针"
+    assert "_OCR_LIVENESS_SEC" in seg, "缺少判活窗口常量"
+    i_age = seg.find("_ocr_task_age_seconds")
+    i_launch = seg.find("nohup bash -c")
+    assert i_age != -1 and i_launch != -1 and i_age < i_launch, (
+        "判活必须在启动命令之前完成（否则重启已在进行）"
+    )

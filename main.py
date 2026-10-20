@@ -1168,6 +1168,13 @@ _OCR_LAUNCH_PROBE_INTERVAL = 1
 #: 拿它统计只会恒 0（add0229b：模型看 22 分钟"0 页"判定卡死，转去解析
 #: 文本层，最终被硬停）。进度必须来自增量信号。
 _OCR_PROGRESS_MARK = "[ocr_run] page "
+#: 判活窗口（秒）：err.log 的 mtime 距今小于此值 ⇒ 认为任务还在推进。
+#: ★ 只能靠文件 mtime 判活：e2b 每次 execute 是独立 PID namespace，跨会话
+#:   `kill -0` 对已死进程恒报 ALIVE（2026-10-19 bgtest4 实锤），镜像里也没有
+#:   ps/pgrep。ocr_run.py 每页写一行进度、渲染每 10 页写一行 ⇒ 正常推进时
+#:   mtime 永远新鲜；超过窗口没动静就允许重启（否则 SIGKILL 留下的 err.log
+#:   会让某个任务永远显示"在跑"，再也重启不了）。
+_OCR_LIVENESS_SEC = 180
 
 # 沙箱内的小工具：报页数 / 按页下标拆子 PDF。单独成文件，避免把路径拼进
 # `python3 -c` 的引号里（路径含空格/中文/引号时会碎）。
@@ -1252,6 +1259,31 @@ async def _ensure_ocr_runner(sandbox_id: str) -> dict:
         return {"success": False, "version": version, "error": wr.get("error")}
     logger.info("[OCR] 下发 ocr_run.py v%s → %s (%d bytes)", version, _OCR_ENTRY, len(payload))
     return {"success": True, "version": version, "error": None}
+
+
+async def _ocr_task_age_seconds(sandbox_id: str, err_path: str) -> int:
+    """沙箱内 OCR 任务的「最近活动距今秒数」；-1 = err.log 不存在或无 mtime。
+
+    判活只能用文件系统信号（PID namespace 隔离，见 _OCR_LIVENESS_SEC 注释）。
+    正常推进时 err.log 每页都在增长，mtime 恒新鲜；SIGKILL（OOM 等）后
+    mtime 冻结，超过 _OCR_LIVENESS_SEC 即认为任务已死、允许重启。
+    """
+    import shlex
+
+    cmd = (
+        "e=%s; now=$(date +%%s); if [ -f \"$e\" ]; then "
+        "m=$(stat -c %%Y \"$e\" 2>/dev/null || echo 0); "
+        "if [ \"$m\" = \"0\" ]; then echo AGE=-1; else echo AGE=$((now-m)); fi; "
+        "else echo AGE=-1; fi" % shlex.quote(err_path)
+    )
+    st = await _sandbox_run(sandbox_id, cmd, timeout=30)
+    text = (st.get("stdout") or "").strip()
+    if not text.startswith("AGE="):
+        return -1
+    try:
+        return int(text.split("=", 1)[1])
+    except (ValueError, IndexError):
+        return -1
 
 
 def _parse_page_spec(spec: str, page_count: int) -> tuple[list[int] | None, str | None]:
@@ -1547,20 +1579,45 @@ async def ocr_pdf_to_text(
     prev_fp = await _read_fingerprint()
     done_code = await _poll_done()
     if done_code is not None and prev_fp != fingerprint:
-        done_code = None  # 作废旧完成信号，按新指纹重跑（bg_cmd 会清场）
+        done_code = None  # 作废旧完成信号，按新指纹重跑（prep 会清场）
+    should_launch = False
     if done_code is None:
-        has_result = (
-            await _sandbox_run(
-                sandbox_id, "test -f %s && echo OK" % shlex.quote(out_json), timeout=30
-            )
-        )
-        if prev_fp == fingerprint and "OK" in (has_result.get("stdout") or ""):
-            # 兜底：done.flag 被清但结果还在且指纹一致 ⇒ 复用
-            warnings0: list[str] = ["复用沙箱内已有 OCR 结果（参数指纹一致，未重跑）"]
-            return await _ocr_collect(
-                sandbox_id, out_json, out_err, page_count, want, pages, dpi,
-                t0, warnings0, n_pages, target_pdf,
-            )
+        # ── 已有同指纹任务是否仍在推进？ ──
+        # ★ 不能无脑重启：prep 的 `rm -f result.json` 会把正在跑的进程写到一半
+        #   的文件 unlink 掉（进程仍往已删除的 inode 写），结果全丢。add0229b
+        #   的续查形态（模型每 ~300s 用完全相同的参数再调）正好踩这条路。
+        #   判活 = err.log 的 mtime 新鲜（PID namespace 隔离下 kill -0 不可用，
+        #   见 _OCR_LIVENESS_SEC）。
+        if prev_fp == fingerprint:
+            age = await _ocr_task_age_seconds(sandbox_id, out_err)
+            if 0 <= age <= _OCR_LIVENESS_SEC:
+                logger.info(
+                    "[OCR] 同指纹任务仍在推进（err.log 最近活动 %ds 前），跳过启动直接续等",
+                    age,
+                )
+                should_launch = False
+            else:
+                # 任务已停（SIGKILL 残留 / 上次中断）⇒ 有非空产物就复用。
+                # ★ 必须 test -s（非空）：`python3 ... > result.json` 在命令启动
+                #   瞬间就创建了 0 字节文件，用 test -f 会把"正在跑"误判成
+                #   "有产物"，复用空文件直接 _fail("read")——2026-10-20 e2e
+                #   T2/T3 实锤（T1 wait_seconds=5 提前返回后，T2 立刻续查）。
+                has_result = await _sandbox_run(
+                    sandbox_id, "test -s %s && echo OK" % shlex.quote(out_json), timeout=30
+                )
+                if "OK" in (has_result.get("stdout") or ""):
+                    warnings0: list[str] = [
+                        "复用沙箱内已有 OCR 结果（参数指纹一致，未重跑）"
+                    ]
+                    return await _ocr_collect(
+                        sandbox_id, out_json, out_err, page_count, want, pages, dpi,
+                        t0, warnings0, n_pages, target_pdf,
+                    )
+                should_launch = True
+        else:
+            should_launch = True
+
+    if done_code is None and should_launch:
         # 启动新的后台任务。启动命令退出码不可全信（e2b process 服务偶发
         # 竞态：同一条命令实测两次一次 exit=1 一次 exit=0），以文件信号为准。
         meta_write = await _sandbox_write(
