@@ -1840,6 +1840,8 @@ async def ocr_pdf_to_text(
     本工具最多等待 wait_seconds 秒。未完成时返回 status="running"（带进度提示），
     **用完全相同的参数（file_path/sandbox_id/pages/dpi/sandbox_pdf_path/batch_pages）
     再调一次即可续查或取回结果，不会重复上传、不会重复 OCR**（沙箱内按参数指纹复用）。
+    上传复用判据：沙箱内同名文件存在且字节数与宿主一致即跳过上传（续查省几十秒 +
+    一次 DLP 全量解密）；宿主文件被替换（大小变化）时仍会重新上传。
 
     **自动分批（2026-10-20 起）**：目标页数超过 batch_pages（默认 40）时，本工具
     自动切成多批，**每批独立进程、跑完即落盘**，一次调用推进一批。返回里
@@ -1927,28 +1929,64 @@ async def ocr_pdf_to_text(
         if bad:
             return bad
         src_pdf = "%s/%s" % (_OCR_WORKDIR, os.path.basename(phys))
+        # ★ 续查跳过重传（2026-10-20 add0229b，P3②）
+        # 生产实测：262 页任务 5 次续查各重传 **256.4 MiB**（MCP 日志 5 条 [DLP]），
+        # 而本函数的 running 文案一直承诺"指纹一致不会重复上传"——文案与实现不符。
+        # 模型每次续查都带同一个 file_path，S1 却无条件走一遍解密+上传。
+        # 判据：沙箱内同名文件存在、且**字节数与宿主一致** ⇒ 就是上一轮传上去的
+        # 那一份，直接用（大文件每轮省几十秒，DLP 全量解密也一并省掉）。
+        # 为什么不用 md5：256 MiB 每轮算一次要几百 ms~数秒，而续查场景下同一路径
+        # 的 PDF 不会变；大小不一致即视为不同文件、照常重传（保守，不会用错文件）。
+        _local_size = -1
+        try:
+            _local_size = os.path.getsize(phys)
+        except OSError:
+            _local_size = -1
+        _reused_upload = False
+        if _local_size > 0:
+            _probe = await _sandbox_run(
+                sandbox_id,
+                "test -s %s && stat -c %%s %s"
+                % (shlex.quote(src_pdf), shlex.quote(src_pdf)),
+                timeout=60,
+            )
+            _probe_lines = (_probe.get("stdout") or "").strip().splitlines()
+            _remote_size = (
+                int(_probe_lines[0])
+                if _probe_lines and _probe_lines[0].isdigit()
+                else -1
+            )
+            if _remote_size == _local_size:
+                _reused_upload = True
+                # 用 warning 而非 info：MCP 的 logging 只挂了 lastResort（WARNING），
+                # info 根本不会出现在 `docker logs`（文件头注释已记录该坑）。
+                logger.warning(
+                    "[OCR] 沙箱内已有同名同尺寸文件（%d B），跳过重传: %s",
+                    _local_size, os.path.basename(phys),
+                )
         # ★ 必须重试：沙箱刚 get_or_create 出来时 envd 还没就绪，e2b 的
         #   connect/files.write 会拿到空响应 → `Expecting value: line 1 column 1`。
         #   2026-10-17 实测：建箱后立刻调，9s 就失败；等模型聊两轮再调就成功。
         #   既有 upload_to_sandbox 没有重试（它历史上一直是被"已经聊了一会儿"的
         #   会话调用），本工具是第一个会紧贴建箱调用的，故在此自保。
         last_err = None
-        for attempt in range(4):
-            prep = await _sandbox_run(
-                sandbox_id, "mkdir -p %s" % shlex.quote(_OCR_WORKDIR), timeout=60
-            )
-            if prep.get("success"):
-                up = await upload_to_sandbox(file_path, src_pdf, sandbox_id)
-                if up.get("success"):
-                    last_err = None
-                    break
-                last_err = up.get("error")
-            else:
-                last_err = prep.get("stderr")
-            if attempt < 3:
-                await _asyncio.sleep(3)
-        if last_err:
-            return _fail("upload", f"上传沙箱失败（已重试 4 次）: {str(last_err)[:400]}")
+        if not _reused_upload:
+            for attempt in range(4):
+                prep = await _sandbox_run(
+                    sandbox_id, "mkdir -p %s" % shlex.quote(_OCR_WORKDIR), timeout=60
+                )
+                if prep.get("success"):
+                    up = await upload_to_sandbox(file_path, src_pdf, sandbox_id)
+                    if up.get("success"):
+                        last_err = None
+                        break
+                    last_err = up.get("error")
+                else:
+                    last_err = prep.get("stderr")
+                if attempt < 3:
+                    await _asyncio.sleep(3)
+            if last_err:
+                return _fail("upload", f"上传沙箱失败（已重试 4 次）: {str(last_err)[:400]}")
 
     # ── S2：沙箱是否具备 OCR 入口（旧模板会让模型重走"自己写脚本"的老路）──
     # ★ 必须 echo OK：本判据读的是 stdout 里有没有 OK，而 grep 命中的输出是

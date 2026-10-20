@@ -1770,3 +1770,103 @@ def test_split_without_target_must_fail_not_silently_ocr():
     assert not any("nohup bash -c" in c for c in sb.commands), (
         "拆分失败后不得启动 OCR 进程（否则白烧一轮探针才报错）"
     )
+
+
+# ────────── 续查跳过重传（P3②，2026-10-20 add0229b）──────────
+# 生产实测：262 页任务 5 次续查各重传 256.4 MiB（MCP 日志 5 条 [DLP]），而
+# running 文案一直承诺"指纹一致不会重复上传"——文案与实现不符。
+# 模型每次续查都带同一个 file_path，S1 却无条件走一遍 DLP 解密 + 上传。
+# 修法：沙箱内同名文件存在且**字节数与宿主一致** ⇒ 视为同一份，跳过上传。
+# 为什么只用 size 不用 md5：256 MiB 每轮算一次要几百 ms~数秒，而续查场景下
+# 同一路径的 PDF 不会变；大小不一致即视为不同文件、照常重传（保守）。
+
+
+class _UploadProbeSandbox:
+    """只关心"沙箱里那个文件有多大"的最小沙箱桩（记录收到的每条命令）。"""
+
+    def __init__(self, remote_size: int):
+        self.remote_size = remote_size
+        self.commands: list[str] = []
+
+    async def run(self, sandbox_id, cmd, timeout=None):
+        self.commands.append(cmd)
+        if cmd.startswith("test -s ") and "stat -c" in cmd:
+            # remote_size < 0 模拟"沙箱里没有这个文件"（test -s 短路，stdout 为空）
+            stdout = "" if self.remote_size < 0 else "%d\n" % self.remote_size
+            return {"success": True, "stdout": stdout, "stderr": ""}
+        if "grep -m1" in cmd:
+            return {"success": True, "stdout": '__version__ = "1.2.1"\nOK\n', "stderr": ""}
+        return {"success": True, "stdout": "", "stderr": ""}
+
+    async def write(self, sandbox_id, path, data):
+        return {"success": True, "error": None}
+
+
+def _run_upload_case(tmp_path, size_delta: int):
+    """传一个带空格/中文名的 PDF，让沙箱报出 (宿主大小 + size_delta) 的尺寸。
+
+    返回 (result, 上传调用列表, 沙箱桩, 宿主大小)。
+    """
+    import asyncio as _asyncio
+
+    host_pdf = tmp_path / "手册 带空格.pdf"
+    host_pdf.write_bytes(b"%PDF-1.4" + b"x" * 4096)
+    size = host_pdf.stat().st_size
+
+    sb = _UploadProbeSandbox(remote_size=size + size_delta)
+    uploads: list = []
+
+    async def _fake_upload(file_path, remote_path, sandbox_id):
+        uploads.append((file_path, remote_path))
+        return {"success": True, "error": None}
+
+    async def _run():
+        ns = _load_ocr_module()
+        ns["_sandbox_run"] = sb.run
+        ns["_sandbox_write"] = sb.write
+        ns["_is_valid_sandbox_id"] = lambda sid: True
+        ns["_upload_precheck"] = lambda phys, orig: None
+        ns["_resolve_host_path"] = lambda p: str(host_pdf)
+        ns["upload_to_sandbox"] = _fake_upload
+        return await ns["ocr_pdf_to_text"](
+            sandbox_id="sbx-test",
+            file_path="/uploads/u/s/手册 带空格.pdf",
+            pages="all",
+            dpi=150,
+            wait_seconds=0,
+        )
+
+    return _asyncio.run(_run()), uploads, sb, size
+
+
+def test_resume_skips_reupload_when_same_size(tmp_path):
+    """沙箱内已有同尺寸同名文件 ⇒ 续查不得重传（省几十秒/轮 + DLP 全量解密）。"""
+    _r, uploads, sb, _size = _run_upload_case(tmp_path, size_delta=0)
+    assert not uploads, "沙箱内已有同尺寸文件仍重传了：%s" % uploads
+    # 归因：必须真的发过尺寸探针，否则"没重传"可能只是路径没走到
+    probes = [c for c in sb.commands if c.startswith("test -s ") and "stat -c" in c]
+    assert probes, "没有发出尺寸探针 —— 不重传的原因无法归因到本判据"
+
+
+def test_resume_reuploads_when_size_differs(tmp_path):
+    """尺寸不一致 ⇒ 视为不同文件，必须重传（保守，绝不用错文件）。"""
+    _r, uploads, sb, _size = _run_upload_case(tmp_path, size_delta=17)
+    assert uploads, "尺寸不一致时仍然跳过上传 —— 会用错文件"
+    assert any("stat -c" in c for c in sb.commands), "尺寸不一致也必须先探测再决定"
+
+
+def test_resume_upload_probe_has_test_s_guard(tmp_path):
+    """探针必须 `test -s && stat -c %s` 组合。
+
+    只发 `stat -c %s` 的话，文件不存在时 stat 报错、stdout 为空 ⇒ 退化成
+    "每次都重传"，修复等于没生效；只发 `test -s` 则拿不到尺寸，无法区分
+    "同名不同内容"。两条必须在**同一条命令**里（分两次调用会多一次往返）。
+    """
+    _r, _uploads, sb, size = _run_upload_case(tmp_path, size_delta=0)
+    probes = [c for c in sb.commands if c.startswith("test -s ") and "stat -c" in c]
+    assert probes, "没有 `test -s ... && stat -c %s ...` 组合探针"
+    cmd = probes[0]
+    assert "&&" in cmd, "存在性检查与取尺寸必须在同一条命令里：%s" % cmd
+    assert "/home/user/_ocr" in cmd, "探针查的不是 OCR 工作目录下的目标文件：%s" % cmd
+    # 断言查的是**这一份**文件（带空格/中文名 ⇒ 命令里必须是 shlex.quote 后的形态）
+    assert "手册 带空格.pdf" in cmd, "探针没带目标文件名，可能查的是别的文件：%s" % cmd
