@@ -1318,3 +1318,16 @@ def test_module_level_imports_cover_runtime_deps():
         if isinstance(t, ast.Name)
     }
     assert "logger" in assigned, "main.py 模块级缺少 logger 赋值"
+
+
+def test_completed_result_has_same_page_fields_as_running():
+    """completed 与 running 必须共用同一套页数字段（e2e 实测的缺口）。
+
+    1.0.14 的 e2e：completed 返回 pages_ocred=3、pages_total=3，却没有
+    pages_ocred_total（running 有）——同名口径缺键，模型两边对不上。
+    """
+    src = _src()
+    node = _func_node(ast.parse(src), "_ocr_collect")
+    seg = ast.get_source_segment(src, node)
+    for key in ("pages_total", "pdf_total_pages", "pages_ocred", "pages_ocred_total"):
+        assert '"%s"' % key in seg, "completed 返回缺少字段 %s" % key

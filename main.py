@@ -2013,6 +2013,9 @@ async def _ocr_collect(
         "pages_total": n_pages,
         "pdf_total_pages": page_count,
         "pages_ocred": len(recs),
+        # 与 running 分支同名字段对齐（e2e 实测 completed 缺这个键，模型对
+        # pages_ocred 与 pages_* 的口径会对不上）
+        "pages_ocred_total": n_pages,
         "pages_failed": failed,
         "total_texts": total_texts,
         "elapsed_sec": round(_time.time() - t0, 1),
