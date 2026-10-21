@@ -76,7 +76,14 @@ from pathlib import Path
 #          行即当前值，与串行/乱序/tail 截断都无关。
 #          ★ 不改 mkldnn：仍走 PaddleOCR 3.x + enable_mkldnn=False（oneDNN
 #          在 paddle 3.3.1 上必崩，见上）。提速只靠并行，不靠换引擎。
-__version__ = "1.3.0"
+#   1.3.1  **修 1.3.0 的默认配比回归**：auto 原来按"一核一进程、每进程 1 线程"
+#          算，在生产 4 核/8GB 模板上实测比串行**慢 34%（0.66x）**、4 核 auto
+#          也慢 42%（0.71x）——因为每进程 1 线程时单页慢 5 倍以上，4 个进程
+#          摊不平。改为"每进程保留 4 线程"（cpu//4），且 workers 不足 4 个
+#          就**退回串行**。16 核模板上 auto 取 4×4 线程 = 1.87x（实测）。
+#          实测表见 _plan_workers 上方注释；教训：**小样本（2 页）测并行度
+#          会把"任务数不足"误读成"并行有效"**。
+__version__ = "1.3.1"
 
 #: 进度行前缀。MCP 侧 `_OCR_PROGRESS_MARK` 必须与此一致（有单测锁定）。
 PROGRESS_PREFIX = "[ocr_run] "
@@ -139,41 +146,61 @@ SAFE_MAX_WORKERS = 16
 SAFE_MIN_THREADS_PER_WORKER = 1
 
 # ── 关键实测结论（决定下面的默认配比，改之前先看）────────────────────
-# 同一批 2 页、总线程数都是 4 的三种形态：
-#   workers=1 threads=4  202.8s   CPU 92.0%（≈3.7/4 核）
-#   workers=2 threads=2  218.2s   CPU 98.4%   ← **比串行还慢 7.6%**
-#   workers=4 threads=1  176.9s   CPU 98.4%   ← 最优，但也只有 1.18x
-# 三条结论：
-#   1) PaddleOCR 3.x（关 mkldnn）**串行就能吃掉 3.5~3.7 个核**——4 核机器上
-#      本来就没剩多少并行空间，"多进程"在 4 核上几乎无效（最好 1.18x）；
-#   2) 总线程数相同时，**进程数多、每进程 1 线程 > 进程数少、每进程多线程**
-#      （218.2 vs 176.9）——Paddle 内部线程池会空转，多进程更能抢到核；
-#   3) 真正的瓶颈是**核数**，不是并行度。加核才能线性提速。
+# ★ 2026-10-21 三档模板实测（**同一台机、同一批 4 页 ×N、150dpi，运行内对照**）。
+#   上一版这里写的是"一核一进程"，依据是一次**只用 2 页**的实验（w=4 时其实
+#   只有 2 个进程在跑）——样本太小，结论是错的，现以这组数据为准：
+#
+#   模板          单进程(全线程)   多进程最佳         相对该机串行
+#   4 核 / 8GB    19.96s/页       w=3×1t 0.71x       w=4×1t **0.66x（倒亏）**
+#   8 核 / 16GB   18.3s/页        w=2×4t 0.99x       w=4×2t 0.74x
+#   16 核 / 32GB  18.8s/页        w=16×1t 2.06x      w=4×4t 1.87x（auto 取这档）
+#
+# 三条硬结论：
+#   1) **单进程在 ~4 线程就饱和**：4 核 19.96s/页、8 核 18.3s/页、16 核 18.8s/页
+#      几乎一样 ⇒ 加核不会让单进程变快，只能靠多进程把闲置的核捡回来；
+#   2) **每进程 1 线程时单页要慢 5 倍以上**（4 核实测 107s vs 19.96s）⇒ 进程太少
+#      就摊不平这个代价：4 核只能起 4 个进程 ⇒ 净亏 34%；8 核 2 进程 ⇒ 打平；
+#      16 核 4~16 个进程才转为正收益；
+#   3) 因此**默认配比按"每进程保留 4 线程"来算**：workers = cpu // 4，且当
+#      workers < SAFE_MIN_PARALLEL_WORKERS 时**直接退回串行**——绝不能出现
+#      "上线后比单进程还慢"这种回归（4 核模板上就是 34%）。
+SAFE_THREADS_SATURATION = 4
+#: 进程并行的最小进程数（低于此值退回串行）。依据见结论 2 的实测表。
+SAFE_MIN_PARALLEL_WORKERS = 4
+
+
 def _plan_workers(cpu: int | None, mem_mb: int | None, requested: int = 0) -> tuple[int, int]:
     """决定 (worker 数, 每 worker 线程数)。
 
-    约束按优先级：
-      1. 内存：workers * SAFE_MEM_PER_WORKER_MB <= 可用内存 * 0.8（主进程还要放
-         整本 PDF 的渲染结果，262 页 PNG ≈130MB，以及 pypdfium2 的缓冲）；
-      2. CPU：workers * threads <= cpu；
-      3. 上限：SAFE_MAX_WORKERS。
+    显式 `--workers` 一律照办（排障/A-B 用），只按 cpu 推线程数。
 
-    默认 **一核一进程、每进程 1 线程**（workers=min(cpu, 内存允许数, 上限)）。
-    依据见上面实测表：总线程数相同时进程数越多越快。内存不够时才退而求其次，
-    让每个进程用多个线程。
+    auto 的约束按优先级：
+      1. 每进程保留 SAFE_THREADS_SATURATION 个线程 ⇒ workers <= cpu // 4；
+      2. 内存：workers * SAFE_MEM_PER_WORKER_MB <= 可用内存 * 0.8；
+      3. 上限：SAFE_MAX_WORKERS；
+      4. **兜底：workers < SAFE_MIN_PARALLEL_WORKERS 就退回串行**（workers=1、
+         threads=cpu）。这条是防回归的闸门，别删。
     """
     cpu = cpu or 1
+
+    def threads_for(workers: int) -> int:
+        # ★ 向上取整：向下取整时"内存闸门压了 workers"会让总线程数少于核数
+        #   （cpu=32/mem=16GB ⇒ 7 进程×4 线程=28 < 32），白白闲 4 个核。
+        #   宁可轻微超订阅（35/32）也不能闲核——实测闲核就是净亏。
+        return max(SAFE_MIN_THREADS_PER_WORKER, -(-cpu // workers))
+
     if requested > 0:
-        workers = requested
-    else:
-        workers = cpu
-        if mem_mb:
-            mem_workers = max(1, int(mem_mb * 0.8) // SAFE_MEM_PER_WORKER_MB)
-            workers = min(workers, mem_workers)
-        workers = min(workers, SAFE_MAX_WORKERS)
-    workers = max(1, workers)
-    threads = max(SAFE_MIN_THREADS_PER_WORKER, cpu // workers)
-    return workers, threads
+        return requested, threads_for(requested)
+
+    workers = max(1, cpu // SAFE_THREADS_SATURATION)
+    if mem_mb:
+        mem_workers = max(1, int(mem_mb * 0.8) // SAFE_MEM_PER_WORKER_MB)
+        workers = min(workers, mem_workers)
+    workers = max(1, min(workers, SAFE_MAX_WORKERS))
+    if workers < SAFE_MIN_PARALLEL_WORKERS:
+        # 进程太少摊不平"单线程每页慢 5x"，退回串行（见上面实测表）
+        return 1, cpu
+    return workers, threads_for(workers)
 
 
 #: worker 进程内的 PaddleOCR 单例。用 initializer 构造一次、复用 N 页 ——

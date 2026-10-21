@@ -50,30 +50,63 @@ class _FakeEngine:
 # ────────────────────────── 1. worker 规划 ──────────────────────────
 
 
-def test_plan_workers_respects_memory_budget():
-    """4 核 / 8GB（当前生产模板）：内存只够 3 个 worker（3 × 1800MB < 6.4GB 预算）。"""
+def test_plan_workers_falls_back_to_serial_on_4_cores():
+    """4 核 / 8GB（**当前生产模板**）：必须退回串行。
+
+    实测（同一批页、同一次运行内）：4 核上 w=4×1 线程 = 0.66x、w=3×1 线程 = 0.71x，
+    都**比串行慢**。所以这里必须是 (1, 4)——上线后绝不比旧版慢，这是回归闸门。
+    """
     mod = _load_runner()
     workers, threads = mod._plan_workers(cpu=4, mem_mb=7952, requested=0)
-    assert workers == 3, (workers, threads)
-    assert threads == 1, (workers, threads)
-    assert workers * mod.SAFE_MEM_PER_WORKER_MB <= int(7952 * 0.8), "worker 数超内存预算"
+    assert (workers, threads) == (1, 4), (workers, threads)
 
 
-def test_plan_workers_respects_cpu_and_cap():
-    """32 核 / 40GB：内存允许 18 个，被 SAFE_MAX_WORKERS=16 截住，每 worker 2 线程。"""
+def test_plan_workers_falls_back_to_serial_on_8_cores():
+    """8 核 / 16GB：2 个进程摊不平单线程的 5x 代价，实测 0.99x ⇒ 也退回串行。"""
     mod = _load_runner()
-    workers, threads = mod._plan_workers(cpu=32, mem_mb=40960, requested=0)
-    assert workers == mod.SAFE_MAX_WORKERS, (workers, threads)
-    assert threads >= 1, "每 worker 至少 1 线程"
-    assert workers * threads <= 32, "超订阅：进程×线程数超过核数"
+    workers, threads = mod._plan_workers(cpu=8, mem_mb=16002, requested=0)
+    assert (workers, threads) == (1, 8), (workers, threads)
 
 
-def test_plan_workers_survives_unknown_memory():
-    """拿不到 MemTotal 时不能算出 0 个 worker（pid 1 容器常见 /proc 不可读）。"""
+def test_plan_workers_uses_multiprocess_on_16_cores():
+    """16 核 / 32GB：4 进程 × 4 线程 = 实测 1.87x（w=16×1 线程 2.06x 但吃 16 份内存）。"""
     mod = _load_runner()
-    workers, threads = mod._plan_workers(cpu=8, mem_mb=None, requested=0)
-    assert workers == 8, (workers, threads)
-    assert threads == 1, (workers, threads)
+    workers, threads = mod._plan_workers(cpu=16, mem_mb=32104, requested=0)
+    assert (workers, threads) == (4, 4), (workers, threads)
+
+
+def test_plan_workers_never_leaves_cores_idle():
+    """不变量：**进程×线程不得少于核数**。
+
+    旧版在 4 核/8GB 上算出 (3, 1)=3 线程 < 4 核，第 4 个核全程闲着自己还慢 42%
+    （内存闸门把 workers 压到 3，而 threads=cpu//workers=1），这是那次回归的直接机理。
+    """
+    mod = _load_runner()
+    for cpu in (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64):
+        for mem in (2048, 4096, 7952, 16002, 32104, 40960, None):
+            workers, threads = mod._plan_workers(cpu=cpu, mem_mb=mem, requested=0)
+            assert workers * threads >= cpu, (cpu, mem, workers, threads)
+
+
+def test_plan_workers_respects_memory_budget():
+    """内存紧时必须压住进程数（超配的后果是 OOM killer 直接 SIGKILL worker）。"""
+    mod = _load_runner()
+    for cpu in (4, 8, 16, 32):
+        for mem in (2048, 4096, 7952, 16002, 32104):
+            workers, threads = mod._plan_workers(cpu=cpu, mem_mb=mem, requested=0)
+            if workers > 1:
+                assert workers * mod.SAFE_MEM_PER_WORKER_MB <= int(mem * 0.8), \
+                    (cpu, mem, workers, threads)
+
+
+def test_plan_workers_parallel_never_below_min_workers():
+    """要么串行，要么进程数 >= 阈值——不存在"2 个进程"这种既慢又费内存的中间态。"""
+    mod = _load_runner()
+    for cpu in (1, 2, 3, 4, 6, 8, 12, 16, 24, 32):
+        for mem in (2048, 7952, 16002, 32104, 40960, None):
+            workers, _threads = mod._plan_workers(cpu=cpu, mem_mb=mem, requested=0)
+            assert workers == 1 or workers >= mod.SAFE_MIN_PARALLEL_WORKERS, \
+                (cpu, mem, workers)
 
 
 def test_plan_workers_explicit_request_wins():
