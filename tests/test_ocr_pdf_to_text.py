@@ -801,6 +801,68 @@ def test_parse_ocr_progress_reads_page_lines():
     assert parse("") == (0, None)
 
 
+def test_parse_ocr_progress_prefers_done_over_page_no():
+    """多进程乱序：页号可能倒退，必须优先用 done=。
+
+    1.3.0 起 8 个 worker 同时跑，完成顺序不保证：`page 37/262` 之后可能紧跟
+    `page 12/262`。若仍按"最后一行页号"当完成数，pages_ocred 会在 37→12 之间
+    来回跳，模型据此判定"进度倒退/任务卡死"——正是我们要消灭的那类误判。
+    """
+    ns = _load_ocr_module()
+    parse = ns["_parse_ocr_progress"]
+    err = "\n".join([
+        "[ocr_run] parallel workers=8 threads_per_worker=4 cpu=32 mem=40960MB pages=262",
+        "[ocr_run] page 30/262 ok texts=48 elapsed=70.1s done=30",
+        "[ocr_run] page 37/262 ok texts=12 elapsed=68.4s done=31",
+        "[ocr_run] page 12/262 ok texts=55 elapsed=71.0s done=32",  # 页号倒退
+    ])
+    done, total = parse(err)
+    assert done == 32, (done, total)
+    assert total == 262, (done, total)
+
+
+def test_parse_ocr_progress_survives_tail_truncation():
+    """err.log 只取尾部时，靠页号去重会严重低估；done 不受影响。
+
+    262 页跑完后 MCP 拿到的 err_tail 只含最后 20 行。按"页号集合大小"统计
+    会报 20 页（实际 262），这是"以为任务才刚开始"的另一种成因。
+    """
+    ns = _load_ocr_module()
+    parse = ns["_parse_ocr_progress"]
+    # 真实形态：整批 262 页跑完，err_tail 只剩最后 20 行（done=243..262）。
+    # done 随**完成顺序**单调递增，而**页号**是乱序的——两者不可混为一谈。
+    # 末行故意放低页号 137：旧逻辑（取末行页号）才会给出错值。
+    tail_pages = list(range(243, 263))
+    tail_pages[-1] = 137
+    lines = ["[ocr_run] page %d/262 ok texts=10 elapsed=70.0s done=%d"
+             % (tail_pages[i], 243 + i) for i in range(len(tail_pages))]
+    done, total = parse("\n".join(lines))
+    assert done == 262, (done, total)
+    assert total == 262, (done, total)
+
+    # 旧脚本（1.2.x，无 done=）只能取最后一行页号 ⇒ 报 137 而非 262。
+    # 这条**不是 bug 断言而是局限记录** —— 正是 1.3.0 起必须带 done= 的原因。
+    legacy = "\n".join(ln.split(" done=")[0] for ln in lines)
+    assert parse(legacy)[0] == 137, parse(legacy)
+
+
+def test_parse_ocr_progress_keeps_done_when_later_line_lacks_it():
+    """带 done 的行之后再出现不带 done 的行，不能把已有计数冲掉。
+
+    真实形态：worker 崩溃后 `_fail` 走的也是 _emit_page（带 done），但混排
+    旧版脚本尾巴或人工追加的日志行时不带 done，不能让计数回退到 0。
+    """
+    ns = _load_ocr_module()
+    parse = ns["_parse_ocr_progress"]
+    err = "\n".join([
+        "[ocr_run] page 5/40 ok texts=1 elapsed=1.0s done=5",
+        "[ocr_run] page 6/40 ok texts=1 elapsed=1.0s",  # 无 done 字段
+    ])
+    done, total = parse(err)
+    assert done == 5, (done, total)
+    assert total == 40, (done, total)
+
+
 def test_progress_mark_matches_sandbox_script():
     """MCP 的进度标记必须与沙箱脚本实际打印的前缀一致（双端契约）。
 
@@ -818,7 +880,10 @@ def test_progress_mark_matches_sandbox_script():
         "MCP 标记 %r 与脚本前缀 %r 不匹配（脚本打的是 '%spage i/n'）"
         % (mark, prefix, prefix)
     )
-    assert '"page %d/%d %s texts=%d elapsed=%.1fs"' in payload, "逐页进度行格式变了"
+    assert '"page %d/%d %s texts=%d elapsed=%.1fs done=%d"' in payload, (
+        "逐页进度行格式变了。1.3.0 起必须带 done=<绝对完成计数>——多进程下页号"
+        "乱序，且 MCP 侧只拿 err_tail，靠页号统计会严重低估已完成页数。"
+    )
     assert re.search(r'__version__\s*=\s*"(\d+)\.(\d+)\.(\d+)"', payload), "缺少版本号"
 
 
@@ -846,7 +911,10 @@ def test_ensure_ocr_runner_writes_repo_payload():
     ns["_sandbox_write"] = _write
     r = _asyncio.run(ns["_ensure_ocr_runner"]("sbx"))
     assert r["success"] is True, r
-    assert r["version"].startswith("1.2"), "下发版本应 >= 1.2.0（带逐页进度），实际 %r" % r["version"]
+    # 用元组比较而不是 startswith("1.2")：后者在版本跨到 1.3/1.10 时要么误挂
+    # 要么把"1.20.0"也当成新版本（字符串前缀的经典坑）。
+    ver = tuple(int(x) for x in r["version"].split(".")[:3])
+    assert ver >= (1, 3, 0), "下发版本应 >= 1.3.0（多进程 + done 计数），实际 %r" % r["version"]
     assert captured["path"] == "/home/user/_ocr/ocr_run.py"
     assert captured["data"] == RUNNER_PY.read_bytes(), "下发字节与仓库文件不一致"
 

@@ -44,11 +44,14 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
 import time as _time
 import traceback
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 # 版本标记（沙箱内用 `grep __version__ /opt/ocr/ocr_run.py` 就能确认部署的是哪一版）
@@ -64,7 +67,16 @@ from pathlib import Path
 #          ★ 用途：MCP 侧的启动可见性探针靠 err.log 是否有内容判断"进程真
 #          起来了"。原 env 行在 `from paddleocr import PaddleOCR` 之后，paddle
 #          导入 5~15s，15s 探针窗口会误判成"没启动"。start 行 <1s 落地。
-__version__ = "1.2.1"
+#   1.3.0  多进程并行（--workers）。逐页串行 → ProcessPoolExecutor。
+#          ★ 为什么：单页 70s（扫描件）× 262 页 = 5.1 小时，而沙箱此前只给
+#          4 核 —— 串行时**一页的卷积只能吃满 4 核**，加核无效。必须多进程。
+#          ★ 进度行必须带 done=<绝对计数>：多进程下页号乱序，而 MCP 侧
+#          err.log 取的是 **tail**，靠"页号集合大小"统计会严重低估（尾部 20
+#          行只含 20 个页号 ⇒ 报 20 页，实际 262）。done 单调递增，取最后一
+#          行即当前值，与串行/乱序/tail 截断都无关。
+#          ★ 不改 mkldnn：仍走 PaddleOCR 3.x + enable_mkldnn=False（oneDNN
+#          在 paddle 3.3.1 上必崩，见上）。提速只靠并行，不靠换引擎。
+__version__ = "1.3.0"
 
 #: 进度行前缀。MCP 侧 `_OCR_PROGRESS_MARK` 必须与此一致（有单测锁定）。
 PROGRESS_PREFIX = "[ocr_run] "
@@ -112,6 +124,111 @@ SAFE_DET_LIMIT = 1500
 # 所以 200dpi 在 ≥8GB 模板上重新变得可行（实测见当日验证记录）；4GB 模板仍建议 150。
 SAFE_DPI_DEFAULT = 150
 SAFE_DPI_MAX = 200
+
+# ── 多进程并行（1.3.0）──────────────────────────────────────────────────
+# 每 worker 常驻内存预算。**1.3.0 沙箱实测（4 vCPU / 7952MB，A4@150dpi 密集文字页）**：
+#   1 进程 mem_lo 6366MB、2 进程 5536MB、4 进程 4179MB
+#   ⇒ 每个增量进程实占 **约 700~1400MB**（单页推理峰值 2127MB 是 A3 横向的最坏
+#   情况，A4 远低于此）。取 1800MB 兼顾"最坏页也不 OOM"与"别把 worker 数算少了"。
+# 超配的后果是 OOM killer 直接 SIGKILL worker（Python 捕获不到），整批作废。
+SAFE_MEM_PER_WORKER_MB = 1800
+#: worker 数硬上限。内存约束才是真正的闸门（进程数 × 1.8GB），这条只是防手滑。
+SAFE_MAX_WORKERS = 16
+
+#: 每 worker 的推理线程数下限。
+SAFE_MIN_THREADS_PER_WORKER = 1
+
+# ── 关键实测结论（决定下面的默认配比，改之前先看）────────────────────
+# 同一批 2 页、总线程数都是 4 的三种形态：
+#   workers=1 threads=4  202.8s   CPU 92.0%（≈3.7/4 核）
+#   workers=2 threads=2  218.2s   CPU 98.4%   ← **比串行还慢 7.6%**
+#   workers=4 threads=1  176.9s   CPU 98.4%   ← 最优，但也只有 1.18x
+# 三条结论：
+#   1) PaddleOCR 3.x（关 mkldnn）**串行就能吃掉 3.5~3.7 个核**——4 核机器上
+#      本来就没剩多少并行空间，"多进程"在 4 核上几乎无效（最好 1.18x）；
+#   2) 总线程数相同时，**进程数多、每进程 1 线程 > 进程数少、每进程多线程**
+#      （218.2 vs 176.9）——Paddle 内部线程池会空转，多进程更能抢到核；
+#   3) 真正的瓶颈是**核数**，不是并行度。加核才能线性提速。
+def _plan_workers(cpu: int | None, mem_mb: int | None, requested: int = 0) -> tuple[int, int]:
+    """决定 (worker 数, 每 worker 线程数)。
+
+    约束按优先级：
+      1. 内存：workers * SAFE_MEM_PER_WORKER_MB <= 可用内存 * 0.8（主进程还要放
+         整本 PDF 的渲染结果，262 页 PNG ≈130MB，以及 pypdfium2 的缓冲）；
+      2. CPU：workers * threads <= cpu；
+      3. 上限：SAFE_MAX_WORKERS。
+
+    默认 **一核一进程、每进程 1 线程**（workers=min(cpu, 内存允许数, 上限)）。
+    依据见上面实测表：总线程数相同时进程数越多越快。内存不够时才退而求其次，
+    让每个进程用多个线程。
+    """
+    cpu = cpu or 1
+    if requested > 0:
+        workers = requested
+    else:
+        workers = cpu
+        if mem_mb:
+            mem_workers = max(1, int(mem_mb * 0.8) // SAFE_MEM_PER_WORKER_MB)
+            workers = min(workers, mem_workers)
+        workers = min(workers, SAFE_MAX_WORKERS)
+    workers = max(1, workers)
+    threads = max(SAFE_MIN_THREADS_PER_WORKER, cpu // workers)
+    return workers, threads
+
+
+#: worker 进程内的 PaddleOCR 单例。用 initializer 构造一次、复用 N 页 ——
+#: PaddleOCR 构造（加载 det/rec 模型）要 5~15s，每页重建等于把并行收益吃光。
+_ENGINE = None
+
+
+def _engine_construct(kw: dict, threads: int | None = None) -> None:
+    """构造 PaddleOCR 单例。子进程 initializer 与串行路径共用这一处。
+
+    threads 只在这里设环境变量：必须在 `import paddle` **之前**，否则 OMP 已
+    初始化，改环境变量无效。
+    """
+    global _ENGINE
+    if threads:
+        for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                     "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+            os.environ[name] = str(threads)
+    from paddleocr import PaddleOCR
+
+    _ENGINE = PaddleOCR(**kw)
+
+
+def _predict_page(task: tuple[int, str]) -> tuple[int, dict, float]:
+    """worker 入口：OCR 一页，返回 (页号, 结果记录, 耗时秒)。
+
+    ★ 单页异常必须在本函数内吃掉：一个坏页（图片截断/超大/OOM 前的
+      MemoryError）不能拖垮整批。真正的 SIGKILL 捕获不到，由主进程的
+      BrokenProcessPool 分支兜底。
+    """
+    page_no, path_str = task
+    t0 = _time.monotonic()
+    rec = {"page": page_no, "input": path_str, "ok": False, "error": "",
+           "texts": [], "scores": [], "polys": []}
+    try:
+        res = _ENGINE.predict(path_str)
+        acc = {"texts": [], "scores": [], "polys": []}
+        _collect(res, acc)
+        rec.update(ok=True, **acc)
+    except Exception as e:  # noqa: BLE001
+        rec["error"] = f"{type(e).__name__}: {str(e).splitlines()[0]}"
+    return page_no, rec, _time.monotonic() - t0
+
+
+def _worker_init(kw: dict, threads: int) -> None:
+    """子进程 initializer：只构造引擎，不碰输入路径。"""
+    try:
+        _engine_construct(kw, threads)
+    except Exception:  # noqa: BLE001
+        # 构造失败必须让父进程看得见，否则会表现为"worker 起来了但每页都失败"
+        print("[ocr_run] worker 构造 PaddleOCR 失败 (pid=%d):" % os.getpid(),
+              file=sys.stderr, flush=True)
+        traceback.print_exc()
+        raise
+
 
 
 def _mem_total_mb():
@@ -209,6 +326,108 @@ def _expand(paths, dpi: int = SAFE_DPI_DEFAULT):
     return out
 
 
+def _emit_page(rec: dict, page_no: int, total: int, elapsed: float, done: int) -> None:
+    """打一行逐页进度。**主进程独占此函数**——多进程下 worker 不打进度行，
+    统一由收集端发，避免多个子进程交错写同一行。
+
+    格式（MCP `main.py::_parse_ocr_progress` 解析，双端有单测锁定）：
+        `[ocr_run] page <页号>/<总页数> <ok|fail> texts=<k> elapsed=<s>s done=<已完成页数>`
+    `done` 是绝对计数，**单调递增**；页号在多进程下是乱序的。MCP 只认 done，
+    页号仅供人看（定位是哪页出问题）。
+    """
+    _progress(
+        "page %d/%d %s texts=%d elapsed=%.1fs done=%d"
+        % (page_no, total, "ok" if rec["ok"] else "fail",
+           len(rec["texts"]), elapsed, done)
+    )
+
+
+def _run_serial(kw: dict, inputs: list, total: int) -> list[dict]:
+    """单进程串行（--workers 1）。保留作 A/B 基线与降级路径。"""
+    try:
+        _engine_construct(kw, None)
+    except Exception:  # noqa: BLE001
+        print("[ocr_run] PaddleOCR 构造失败:", file=sys.stderr)
+        traceback.print_exc()
+        raise
+    results = []
+    for page_no, img in enumerate(inputs, 1):
+        page_no, rec, elapsed = _predict_page((page_no, str(img)))
+        results.append(rec)
+        _emit_page(rec, page_no, total, elapsed, len(results))
+    return results
+
+
+def _run_parallel(kw: dict, inputs: list, total: int, workers: int,
+                  threads: int) -> tuple[list[dict], bool]:
+    """多进程并行。返回 (按页序排好的 results, 是否发生 worker 崩溃)。
+
+    为什么用 ProcessPoolExecutor 而不是线程：Paddle 的推理是 C++ 里跑满了
+    GIL 的重计算，线程池拿不到并行；只有多进程能真正摊到多核。
+    """
+    results: list[dict] = []
+    done = 0
+    broken = False
+    tasks = [(i, str(img)) for i, img in enumerate(inputs, 1)]
+    cursor = 0
+    pending: dict = {}
+
+    def _fail(page_no: int, exc) -> None:
+        nonlocal done
+        msg = "%s: %s" % (type(exc).__name__, str(exc).splitlines()[0] if str(exc) else "")
+        rec = {"page": page_no, "input": "", "ok": False, "error": msg,
+               "texts": [], "scores": [], "polys": []}
+        done += 1
+        results.append(rec)
+        _emit_page(rec, page_no, total, 0.0, done)
+
+    def _ok(fut, page_no: int) -> None:
+        nonlocal done
+        try:
+            _, rec, elapsed = fut.result()
+        except BaseException as exc:  # noqa: BLE001
+            _fail(page_no, exc)
+            return
+        done += 1
+        results.append(rec)
+        _emit_page(rec, page_no, total, elapsed, done)
+
+    # 窗口 = workers（不放大：每多一个在飞任务就多压一份页图内存）
+    window = max(2, workers)
+    with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init,
+                             initargs=(kw, threads)) as pool:
+        while cursor < len(tasks) or pending:
+            while not broken and cursor < len(tasks) and len(pending) < window:
+                page_no, path_str = tasks[cursor]
+                cursor += 1
+                try:
+                    pending[pool.submit(_predict_page, (page_no, path_str))] = page_no
+                except BaseException as exc:  # noqa: BLE001
+                    broken = True
+                    _fail(page_no, exc)
+            if pending:
+                finished, _ = wait(list(pending), return_when=FIRST_COMPLETED)
+                for fut in finished:
+                    page_no = pending.pop(fut)
+                    exc = fut.exception()
+                    # BrokenProcessPool = worker 被 OOM killer 杀了（SIGKILL
+                    # 捕获不到），此时 pool 已不可用，后续 submit 必抛。
+                    if isinstance(exc, BrokenProcessPool):
+                        broken = True
+                    _ok(fut, page_no)
+            if broken:
+                for fut, page_no in list(pending.items()):
+                    fut.cancel()
+                    _fail(page_no, BrokenProcessPool("worker 进程异常退出"))
+                pending.clear()
+                for page_no, _p in tasks[cursor:]:
+                    _fail(page_no, BrokenProcessPool("worker 进程异常退出"))
+                cursor = len(tasks)
+                break
+
+    return sorted(results, key=lambda r: r["page"]), broken
+
+
 def main(argv=None) -> int:
     # ★ 第一句就打 start 行：MCP 侧启动可见性探针只认 err.log 有没有内容，
     #   而 `from paddleocr import PaddleOCR` 要 5~15s。放在 import 之后会让
@@ -228,13 +447,17 @@ def main(argv=None) -> int:
                          % SAFE_DET_LIMIT)
     ap.add_argument("--allow-mkldnn", action="store_true",
                     help="显式打开 oneDNN（默认关闭）。除非你确认 paddle 已修复，否则别用。")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="并行进程数。0=自动（按 CPU 与内存推算，见 _plan_workers）；"
+                         "1=退回逐页串行（A/B 基线，或 worker 被 OOM 杀掉后的降级重跑）。")
     args = ap.parse_args(argv)
 
-    try:
-        from paddleocr import PaddleOCR
-    except Exception:  # noqa: BLE001
-        print("[ocr_run] 无法 import paddleocr，镜像未正确预装？", file=sys.stderr)
-        traceback.print_exc()
+    # 只查模块在不在，**不真 import**：paddle 一 import 就会建 OMP 线程池，
+    # fork 出来的 worker 会继承一个已初始化的线程池状态（且线程数已固定，
+    # 后面的 OMP_NUM_THREADS 设置失效）。真正的 import 放在 worker 内 /
+    # _engine_construct 里。
+    if importlib.util.find_spec("paddleocr") is None:
+        print("[ocr_run] 找不到 paddleocr 模块，镜像未正确预装？", file=sys.stderr)
         return 1
 
     kw = dict(SAFE_KW)
@@ -270,40 +493,30 @@ def main(argv=None) -> int:
         print(f"[ocr_run] 输入处理失败: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
+    total_pages = len(inputs)
+    workers, threads = _plan_workers(os.cpu_count(), mem, args.workers)
+    # 日志必须点名并行配置：出问题时要能一眼看出"几个进程 × 几线程"，
+    # 而不是回来翻命令行。
+    _progress("parallel workers=%d threads_per_worker=%d cpu=%s mem=%sMB pages=%d"
+              % (workers, threads, os.cpu_count(), mem if mem else "?", total_pages))
+    _progress("ocr start pages=%d" % total_pages)
+
     try:
-        ocr = PaddleOCR(**kw)
+        if workers <= 1:
+            results = _run_serial(kw, inputs, total_pages)
+            broken = False
+        else:
+            results, broken = _run_parallel(kw, inputs, total_pages, workers, threads)
     except Exception:  # noqa: BLE001
-        print("[ocr_run] PaddleOCR 构造失败:", file=sys.stderr)
+        print("[ocr_run] OCR 执行失败:", file=sys.stderr)
         traceback.print_exc()
         return 1
 
-    results = []
-    total_text = 0
-    total_pages = len(inputs)
-    _progress("ocr start pages=%d" % total_pages)
-    for page_no, img in enumerate(inputs, 1):
-        page_t0 = _time.monotonic()
-        rec = {"page": page_no, "input": str(img), "ok": False, "error": "",
-               "texts": [], "scores": [], "polys": []}
-        try:
-            res = ocr.predict(str(img))
-            acc = {"texts": [], "scores": [], "polys": []}
-            _collect(res, acc)
-            rec.update(ok=True, **acc)
-        except Exception as e:  # noqa: BLE001
-            rec["error"] = f"{type(e).__name__}: {str(e).splitlines()[0]}"
-            print(f"[ocr_run] {img} 推理失败: {rec['error']}", file=sys.stderr)
-            traceback.print_exc()
-        total_text += len(rec["texts"])
-        results.append(rec)
-        # 逐页进度行：MCP 的 ocr_pdf_to_text 解析它算真实 pages_ocred
-        # （格式 `[ocr_run] page <i>/<n> <ok|fail> texts=<k> elapsed=<s>s`，
-        # 解析器见 main.py::_parse_ocr_progress，两边有单测锁定）。
-        _progress(
-            "page %d/%d %s texts=%d elapsed=%.1fs"
-            % (page_no, total_pages, "ok" if rec["ok"] else "fail",
-               len(rec["texts"]), _time.monotonic() - page_t0)
-        )
+    total_text = sum(len(r["texts"]) for r in results)
+    if broken:
+        print("[ocr_run] 有 worker 异常退出（多为内存不足被 OOM killer 杀掉）："
+              "失败页已单独标记，建议用 --workers %d 重跑缺页。"
+              % max(1, workers // 2), file=sys.stderr)
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -312,7 +525,7 @@ def main(argv=None) -> int:
             for t in rec["texts"]:
                 print(t)
 
-    if any(r["error"] for r in results):
+    if broken or any(r["error"] for r in results):
         return 1
     return 0 if total_text > 0 else 2
 

@@ -1252,10 +1252,18 @@ def _parse_ocr_progress(err_text: str) -> tuple[int, int | None]:
     """从 err.log 解析沙箱侧 OCR 进度：(已完成页数, 本次任务总页数|None)。
 
     ocr_run.py 每页往 stderr 打一行
-        `[ocr_run] page <i>/<n> ok texts=<k> elapsed=<s>s`
-    取最后一行的 i/n。没有进度行时返回 (0, None)——此时要么还在渲染
-    （PDF→PNG 是整批做的，渲染完才开始逐页），要么进程没起来。调用方
-    配合 err.log 是否有内容来区分这两种情况。
+        `[ocr_run] page <页号>/<n> ok texts=<k> elapsed=<s>s done=<已完成页数>`
+    优先取最后一行的 `done=`；没有 `done=`（1.2.x 旧脚本）才回退取最后一行的
+    页号 i。没有进度行时返回 (0, None)——此时要么还在渲染（PDF→PNG 是整批做
+    的，渲染完才开始逐页），要么进程没起来。调用方配合 err.log 是否有内容来
+    区分这两种情况。
+
+    ★ 为什么不能靠"页号"统计（1.3.0 多进程后必坏）：
+      1) 多进程下完成顺序乱序，`page 37/40` 之后可能紧跟 `page 12/40`；
+      2) 本函数拿到的是 **err_tail（截断的尾部）**，用页号集合去重计数会严
+         重低估——尾部 20 行只含 20 个页号就等于报 20 页，而实际已跑完 262。
+      `done` 是主进程独占累加的绝对计数，单调递增，取最后一行即当前真值，
+      与乱序、tail 截断都无关。
 
     ★ 为什么不用 result.json 统计：它只在整批跑完才一次性落地，轮询期间
       永远是旧文件或不存在 ⇒ pages_ocred 恒 0（add0229b 模型据此判定
@@ -1263,13 +1271,16 @@ def _parse_ocr_progress(err_text: str) -> tuple[int, int | None]:
     """
     done = 0
     total: int | None = None
+    #: 旧脚本（1.2.x）没有 done=，用它兜底；新脚本里页号只作兜底不用来计数。
+    last_page_no = 0
+    saw_done = False
     for line in (err_text or "").splitlines():
         if _OCR_PROGRESS_MARK not in line:
             continue
         seg = line.split(_OCR_PROGRESS_MARK, 1)[1].strip()
         head, _, rest = seg.partition("/")
         try:
-            done = int(head.strip())
+            last_page_no = int(head.strip())
         except ValueError:
             continue
         if rest:
@@ -1277,6 +1288,18 @@ def _parse_ocr_progress(err_text: str) -> tuple[int, int | None]:
                 total = int(rest.split()[0].strip())
             except (ValueError, IndexError):
                 pass
+        # 内联正则而非模块级常量：本函数由测试用 AST 抽取到独立命名空间执行，
+        # 那里的常量注入走 ast.literal_eval，编译好的 pattern 吃不下 ⇒ 会因
+        # 缺名而 NameError。re 模块自己带 pattern 缓存，重复编译无实际开销。
+        m = re.search(r"\bdone=(\d+)\b", seg)
+        if m:
+            try:
+                done = int(m.group(1))
+                saw_done = True
+            except ValueError:
+                pass
+    if not saw_done:
+        done = last_page_no
     return done, total
 
 
