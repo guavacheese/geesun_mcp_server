@@ -1741,6 +1741,43 @@ def _plan_ocr_batches(target_pages: list[int], batch_pages: int) -> list[list[in
     return [target_pages[i:i + batch_pages] for i in range(0, len(target_pages), batch_pages)]
 
 
+def _ocr_segment_dir(want: list[int] | None, page_count: int) -> str:
+    """非分批（单批）路径的产物目录：按**页段**隔离。
+
+    ## 为什么必须隔离
+
+    add0229b 第 5/6 轮：模型手工分批（`pages="1-30"` / `31-60` / `61-90`，
+    以及 `9-148` 的 7 批 × 20 页）。这些调用都**没超过** batch_pages，所以
+    全走「非分批」路径 ⇒ 三批/七批全部写同一个 `_OCR_WORKDIR/result.json`，
+    后批覆盖前批。沙箱随后被 lifecycle 回收，连「曾经跑出过 140 页」都无从
+    证明（日志里只剩最后一批的产物）。
+
+    分批模式本来就有 `batches/bNNN/` 一目录一批；单批路径没有对应隔离 ——
+    这是两条路径口径不一致，不是新增需求。
+
+    ## slug 规则
+
+    · 全量 / 覆盖全书 ⇒ `all`
+    · 连续页段          ⇒ `<lo>-<hi>`（如 `9-30`），同一页段重复调用命中同一
+      目录 ⇒ 幂等复用（相同指纹不重跑）
+    · 非连续页集        ⇒ `<lo>-<hi>_n<count>_<hash6>`。只按区间命名会让
+      「1-30」与「1-30,32」撞目录（页数不同、结果互相覆盖），所以非连续时
+      必须带页数与内容摘要。
+    """
+    if not want or len(want) >= page_count:
+        return "%s/segments/all" % _OCR_WORKDIR
+    lo, hi = want[0] + 1, want[-1] + 1
+    if len(want) == hi - lo + 1:
+        return "%s/segments/%d-%d" % (_OCR_WORKDIR, lo, hi)
+    # 局部 import：本文件的顶层没有 hashlib，而测试用 AST 抽函数 + 注入模块
+    # 的方式执行，顶层新增 import 需要同步改测试桩；局部 import 交给 Python
+    # 正常解析，不牵连测试设施。
+    import hashlib
+
+    digest = hashlib.md5(",".join(str(i) for i in want).encode()).hexdigest()[:6]
+    return "%s/segments/%d-%d_n%d_%s" % (_OCR_WORKDIR, lo, hi, len(want), digest)
+
+
 def _batch_state_new(
     fingerprint: str, groups: list[list[int]], batch_pages: int, created_at: float
 ) -> dict:
@@ -2101,6 +2138,9 @@ async def ocr_pdf_to_text(
             await _batch_state_save(sandbox_id, _OCR_BATCH_STATE, batch_state)
 
     target_pdf = src_pdf
+    # 单批路径的产物目录：按页段隔离（分批走 batches/bNNN，本来就隔离）。
+    # 这里必须早于 mkdir/产物路径计算，否则两处会用不同目录。
+    seg_dir = "" if batching else _ocr_segment_dir(want, page_count)
     if want is not None:
         # ★ 沙箱侧 _page.py 固定把子 PDF 写在 `src + ".sub.pdf"`（helper 的既有
         #   约定，不能改——单批路径与历史产物都依赖它）。分批模式必须再「搬」
@@ -2114,7 +2154,7 @@ async def ocr_pdf_to_text(
         split_src = src_pdf + ".sub.pdf"
         sub = ("%s/input.sub.pdf" % batch_dir) if batching else split_src
         parts = [
-            "mkdir -p %s" % shlex.quote(batch_dir or _OCR_WORKDIR),
+            "mkdir -p %s" % shlex.quote(batch_dir or seg_dir or _OCR_WORKDIR),
             "python3 %s %s %s"
             % (
                 shlex.quote(helper),
@@ -2156,10 +2196,12 @@ async def ocr_pdf_to_text(
         out_done = "%s/done.flag" % batch_dir
         out_meta = "%s/ocr.meta" % batch_dir
     else:
-        out_json = "%s/result.json" % _OCR_WORKDIR
-        out_err = "%s/err.log" % _OCR_WORKDIR
-        out_done = "%s/done.flag" % _OCR_WORKDIR
-        out_meta = "%s/ocr.meta" % _OCR_WORKDIR
+        # 按页段隔离：模型手工分批时每批一个目录，后批不再覆盖前批的
+        # result.json（add0229b 两次「跑出来又全没了」的直接成因）。
+        out_json = "%s/result.json" % seg_dir
+        out_err = "%s/err.log" % seg_dir
+        out_done = "%s/done.flag" % seg_dir
+        out_meta = "%s/ocr.meta" % seg_dir
     n_pages = page_count if want is None else len(want)
 
     # 指纹：src_pdf + pages + dpi 全同才允许复用（pages 不同必须重跑，
@@ -2298,7 +2340,7 @@ async def ocr_pdf_to_text(
             % (
                 # 分批时清场只清**本批目录**：前面批次的产物必须留着，
                 # 否则"失败只丢当前批"就变成"每批都丢前面所有批"。
-                shlex.quote(batch_dir or _OCR_WORKDIR),
+                shlex.quote(batch_dir or seg_dir or _OCR_WORKDIR),
                 shlex.quote(out_json),
                 shlex.quote(out_err),
                 shlex.quote(out_done),
@@ -2447,7 +2489,10 @@ async def ocr_pdf_to_text(
                 "payload_json": None,
                 "payload_txt": None,
                 "sandbox_path": target_pdf,
-                "sandbox_dir": _OCR_WORKDIR,
+                # 回显**产物目录**而非根目录：模型据此能直接 ls 到 result.json
+                # （按页段隔离后，根目录下已经没有 result.json 了）
+                "sandbox_dir": batch_dir or seg_dir or _OCR_WORKDIR,
+                "segment_dir": seg_dir or None,
                 "preview": "",
                 "warnings": [],
                 "progress_hint": (
@@ -2638,7 +2683,10 @@ async def _ocr_collect(
         # 沙箱内路径回显：模型据此知道文件在哪、不必重新上传（add0229b：
         # ls /home/user 没看到 _ocr/ 子目录 ⇒ 结论"PDF 没上传" ⇒ 重传 268MB）。
         "sandbox_path": sandbox_path,
-        "sandbox_dir": _OCR_WORKDIR,
+        # 产物目录 = out_json 所在目录：按页段隔离后它就是 segments/<段>，
+        # 分批时是 batches/bNNN。用 dirname 而不是引 batch_dir/seg_dir，
+        # 因为它们不在本函数作用域里（_ocr_collect 只拿到产物路径）。
+        "sandbox_dir": os.path.dirname(out_json) or _OCR_WORKDIR,
         "preview": body[:_OCR_PREVIEW_CHARS],
         "warnings": warnings,
     }

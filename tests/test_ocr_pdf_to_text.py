@@ -450,6 +450,15 @@ def _load_ocr_module():
     # 下发动作在单测里用 stub 顶替（真实下发的测试见
     # test_ocr_runner_shipped_*，那里 mock 掉 _sandbox_write）。
     ns["_ensure_ocr_runner"] = _stub_ensure_runner
+    # `_ocr_segment_dir` 是**另一个顶层函数**，AST 只抽了 ocr_pdf_to_text 一个，
+    # 不会把它带过来 ⇒ 不补的话单批路径 NameError（2026-10-21 加按页段隔离时
+    # 实测：18 个用例一起挂，全是 name '_ocr_segment_dir' is not defined）。
+    # ★ 教训：给被测函数新增顶层依赖时，必须同步改这个 ns，否则测试报的是
+    #   "桩缺名"而不是"实现有 bug"，很容易被误读成实现坏了。
+    for _n in ast.parse(_src()).body:
+        if isinstance(_n, ast.FunctionDef) and _n.name == "_ocr_segment_dir":
+            exec(compile(ast.Module(body=[_n], type_ignores=[]), str(MAIN_PY), "exec"), ns)  # noqa: S102
+            break
     mod = ast.Module(body=body, type_ignores=[])
     exec(compile(mod, str(MAIN_PY), "exec"), ns)  # noqa: S102
     return ns
@@ -777,7 +786,11 @@ def test_running_result_carries_sandbox_path_and_real_progress():
     assert r["pages_ocred"] == 7, "进度必须来自 err.log 逐页行，实际：%s" % r["pages_ocred"]
     assert r["pages_ocred_total"] == 20, r
     assert r["sandbox_path"] == "/home/user/_ocr/e2e.pdf", r
-    assert r["sandbox_dir"] == "/home/user/_ocr", r
+    # ★ 2026-10-21 P3：sandbox_dir 的语义从「根目录」改成「**产物目录**」。
+    #   按页段隔离后根目录下已经没有 result.json，回显根目录会让模型 ls 不到
+    #   产物、断言"没跑出来"。全量任务（pages=all）的统一落点是 segments/all。
+    assert r["sandbox_dir"] == "/home/user/_ocr/segments/all", r
+    assert r["segment_dir"] == "/home/user/_ocr/segments/all", r
     assert "正在逐页 OCR" in r["progress_hint"], r["progress_hint"]
     assert "不要重新上传" in r["progress_hint"], r["progress_hint"]
 
@@ -1938,3 +1951,77 @@ def test_resume_upload_probe_has_test_s_guard(tmp_path):
     assert "/home/user/_ocr" in cmd, "探针查的不是 OCR 工作目录下的目标文件：%s" % cmd
     # 断言查的是**这一份**文件（带空格/中文名 ⇒ 命令里必须是 shlex.quote 后的形态）
     assert "手册 带空格.pdf" in cmd, "探针没带目标文件名，可能查的是别的文件：%s" % cmd
+
+
+# ─────────────── 产物目录按页段隔离（2026-10-21 P3）───────────────
+
+
+def _load_segment_dir():
+    """摘出 `_ocr_segment_dir` 并注入它依赖的 `_OCR_WORKDIR`。"""
+    node = _func_node(ast.parse(_src()), "_ocr_segment_dir")
+    assert node is not None, "main.py 里找不到 _ocr_segment_dir"
+    ns: dict = {"_OCR_WORKDIR": "/home/user/_ocr"}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(MAIN_PY), "exec"), ns)  # noqa: S102
+    return ns["_ocr_segment_dir"]
+
+
+def test_segment_dir_isolates_manual_batches():
+    """模型手工分批必须落**不同**目录。
+
+    add0229b 第 5/6 轮：模型用 `pages="1-30"` / `31-60` / `61-90`（以及
+    `9-148` 的 7 批 ×20 页）手工分批，这些调用都没超过 batch_pages，全走
+    「非分批」路径 ⇒ 全写同一个 `_OCR_WORKDIR/result.json`，后批覆盖前批。
+    沙箱被 lifecycle 回收后，140 页结果连「曾经存在过」都无从证明。
+    """
+    seg = _load_segment_dir()
+    d1 = seg(list(range(0, 30)), 262)
+    d2 = seg(list(range(30, 60)), 262)
+    d3 = seg(list(range(60, 90)), 262)
+    assert len({d1, d2, d3}) == 3, "三批落到了同一目录：%s" % {d1, d2, d3}
+    assert d1.endswith("/segments/1-30"), d1
+    assert d2.endswith("/segments/31-60"), d2
+    assert d3.endswith("/segments/61-90"), d3
+
+
+def test_segment_dir_is_idempotent_for_same_span():
+    """同一页段重复调用要命中同一目录 —— 这是「指纹复用不重跑」的前提。"""
+    seg = _load_segment_dir()
+    assert seg(list(range(8, 148)), 262) == seg(list(range(8, 148)), 262)
+
+
+def test_segment_dir_full_document_uses_all():
+    """全量（want=None 或覆盖全书）统一落 segments/all。"""
+    seg = _load_segment_dir()
+    assert seg(None, 262).endswith("/segments/all")
+    assert seg(list(range(262)), 262).endswith("/segments/all")
+
+
+def test_segment_dir_separates_non_contiguous_same_span():
+    """同区间但页集不同，必须分开。
+
+    只按 [lo,hi] 命名会让「1-30」与「1-30,32」撞目录：页数不同、结果互相
+    覆盖，正是本次要根治的失败形态。
+    """
+    seg = _load_segment_dir()
+    contiguous = seg(list(range(0, 30)), 262)
+    sparse = seg(list(range(0, 30)) + [31], 262)
+    assert contiguous != sparse, "非连续页集与同区间连续页段撞目录"
+    assert "_n31_" in sparse, sparse
+
+
+def test_non_batch_artifacts_no_longer_share_root_result_json():
+    """接线断言：非分批路径的四个产物必须挂在 seg_dir 下，不能再用根目录。
+
+    只测 `_ocr_segment_dir` 会漏掉「算出来但没用上」——本项目已有先例
+    （1.0.16 拆了子 PDF 却忘了 mv 到批目录，三批全 FileNotFoundError）。
+    """
+    src = _src()
+    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    body = ast.get_source_segment(src, node) or ""
+    for name in ("out_json", "out_err", "out_done", "out_meta"):
+        assert '"%%s/%s" %% seg_dir' % {
+            "out_json": "result.json", "out_err": "err.log",
+            "out_done": "done.flag", "out_meta": "ocr.meta",
+        }[name] in body, "非分批路径的 %s 仍指向根目录" % name
+    # 清场与 mkdir 也必须用同一目录，否则新目录不会被创建
+    assert "batch_dir or seg_dir or _OCR_WORKDIR" in body
