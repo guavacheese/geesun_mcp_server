@@ -1208,6 +1208,13 @@ _OCR_BATCH_DIR = "%s/batches" % _OCR_WORKDIR
 #: ★ 必须落沙箱：MCP 进程是无状态的，每次工具调用都是新任务，
 #:   "上一批跑到哪"只能存在被操作的那一侧。
 _OCR_BATCH_STATE = "%s/state.json" % _OCR_BATCH_DIR
+#: 任务句柄目录（2026-10-22 方案 D）：jobs/<job_id>.json 存「句柄 → 规范参数」
+#: 映射。submit 时写一次，ocr_status 续查时只读 —— 输入只在提交时传一次，
+#: 续查不再携带 file_path，DLP 重复解密上传从结构上消失。
+_OCR_JOBS_DIR = "%s/jobs" % _OCR_WORKDIR
+#: 句柄格式闸门：job_id 来自模型输出，拼路径前必须过这个正则
+#: （防路径穿越/shell 注入；同时是「句柄不存在」的快速判据）。
+_OCR_JOB_ID_RE = re.compile(r"^ocrj-[0-9a-f]{12}$")
 
 
 def _bump_silent_streak(key: str) -> int:
@@ -1875,6 +1882,65 @@ def _first_json_value(raw: str):
     return None
 
 
+# ─── 任务句柄助手（2026-10-22 方案 D，对照 deer-flow tasks 契约）───────────
+# deer-flow 的 status 轮询只传 task_id（mcp/tasks/ordinary.py），输入在 submit
+# 传一次 —— 我们此前的续查每轮重发全量参数，S1 每轮重走 DLP 解密+上传
+# （add0229b 实测 4 段 × 5 轮 ≈ 20 次无效 256.4 MiB 传输）。句柄化后输入只在
+# submit 传一次，续查只带 job_id，重传问题类整个消失。
+
+
+def _ocr_job_id(sandbox_id: str, src_pdf: str, pages: str, dpi: int, batch_pages: int) -> str:
+    """任务句柄：由规范参数决定（确定性哈希）。
+
+    为什么用哈希不用 uuid：MCP 无状态，句柄→参数映射必须落沙箱文件；确定性
+    句柄让「同参数重复提交」天然幂等（指向同一份 job 记录，不会裂成两个任务）。
+    """
+    import hashlib
+
+    canon = "|".join(
+        [sandbox_id, src_pdf, str(pages), str(int(dpi)), str(int(batch_pages or 0))]
+    )
+    return "ocrj-" + hashlib.md5(canon.encode("utf-8")).hexdigest()[:12]
+
+
+async def _ocr_job_save(sandbox_id: str, job_id: str, record: dict) -> dict:
+    """句柄记录落沙箱。★ MCP 无状态：句柄↔参数映射只能存被操作的那一侧
+    （与 batches/state.json 同理），沙箱被回收 = 句柄失效（ocr_status 会显式报）。"""
+    import time as _time
+
+    path = "%s/%s.json" % (_OCR_JOBS_DIR, job_id)
+    rec = dict(record)
+    rec["job_id"] = job_id
+    rec["sandbox_id"] = sandbox_id
+    rec.setdefault("created_at", _time.time())
+    payload = json.dumps(rec, ensure_ascii=False).encode("utf-8")
+    return await _sandbox_write(sandbox_id, path, payload)
+
+
+async def _ocr_job_load(sandbox_id: str, job_id: str) -> dict | None:
+    """读句柄记录；不存在/格式非法/解析失败一律返回 None（调用方显式报错）。
+
+    ★ job_id 是模型给的字符串，拼路径前必须过 `_OCR_JOB_ID_RE` 格式闸门 ——
+      这条正则同时是防注入闸门，绝不能因为"自己生成的应该没问题"而跳过。
+    """
+    import shlex
+
+    if not _OCR_JOB_ID_RE.match(job_id or ""):
+        return None
+    path = "%s/%s.json" % (_OCR_JOBS_DIR, job_id)
+    st = await _sandbox_run(sandbox_id, "cat %s 2>/dev/null" % shlex.quote(path), timeout=30)
+    raw = (st.get("stdout") or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("job_id") != job_id:
+        return None
+    return data
+
+
 @mcp.tool()
 async def ocr_pdf_to_text(
     sandbox_id: str,
@@ -1896,12 +1962,14 @@ async def ocr_pdf_to_text(
       · pytesseract 没装中文包，出来的是乱码。
     本工具把这些都处理好了，你只需要给路径。
 
-    **执行模型（2026-10-19 改，submit-and-poll）**：OCR 在沙箱内后台运行，
-    本工具最多等待 wait_seconds 秒。未完成时返回 status="running"（带进度提示），
-    **用完全相同的参数（file_path/sandbox_id/pages/dpi/sandbox_pdf_path/batch_pages）
-    再调一次即可续查或取回结果，不会重复上传、不会重复 OCR**（沙箱内按参数指纹复用）。
-    上传复用判据：沙箱内同名文件存在且字节数与宿主一致即跳过上传（续查省几十秒 +
-    一次 DLP 全量解密）；宿主文件被替换（大小变化）时仍会重新上传。
+    **执行模型（2026-10-22 句柄化，submit-and-poll）**：OCR 在沙箱内后台运行，
+    本工具最多等待 wait_seconds 秒。未完成时返回 status="running"（带进度提示
+    和 **job_id 任务句柄**）。续查有两条路，**都不重复上传、不重复 OCR**：
+      · agent 自动续查（推荐）：框架检测到 running 会自动用 ocr_status(job_id)
+        轮询直到完成 —— 你**只管发这一次调用，等最终结果即可**；
+      · 手动续查：把 job_id 传给 ocr_status(sandbox_id, job_id)。
+    旧的「用完全相同参数再调一次」仍然兼容（按指纹复用），但已非首选——
+    它每轮都要重走定位与解密上传判据，大文件场景慢且浪费。
 
     **自动分批（2026-10-20 起）**：目标页数超过 batch_pages（默认 40）时，本工具
     自动切成多批，**每批独立进程、跑完即落盘**，一次调用推进一批。返回里
@@ -1933,6 +2001,8 @@ async def ocr_pdf_to_text(
     Returns:
         {"success": bool, "step": str|None, "error": str|None,
          "status": "completed"|"running",
+         "job_id": str,             # 任务句柄：续查用 ocr_status(sandbox_id, job_id)
+         "sandbox_id": str,         # 回显，方便 ocr_status 直传
          "pages_total": int,        # 本批要 OCR 的页数
          "pdf_total_pages": int,    # 文档总页数
          "pages_ocred": int, "pages_failed": int,
@@ -2047,6 +2117,56 @@ async def ocr_pdf_to_text(
                     await _asyncio.sleep(3)
             if last_err:
                 return _fail("upload", f"上传沙箱失败（已重试 4 次）: {str(last_err)[:400]}")
+
+    # ── 句柄化（2026-10-22 方案 D）：上传只发生在本函数（submit），后续续查
+    #    由 agent drive 用 ocr_status(job_id) 轻量查询，不再重发参数/重传文件。
+    #    batch_pages 必须先归一化再算句柄：模型传 0（自动）与显式 40 必须指到
+    #    同一个任务，否则同一文档会裂出两个 job。
+    bp = int(batch_pages or 0)
+    if bp <= 0:
+        bp = _OCR_BATCH_PAGES
+    bp = max(1, min(bp, _OCR_BATCH_PAGES_MAX))
+    job_id = _ocr_job_id(sandbox_id, src_pdf, str(pages), int(dpi), bp)
+    saved = await _ocr_job_save(
+        sandbox_id, job_id,
+        {"src_pdf": src_pdf, "pages": str(pages), "dpi": int(dpi), "batch_pages": bp},
+    )
+    if not saved.get("success"):
+        return _fail("prepare", "写入任务句柄失败: %s" % (saved.get("error") or "")[:300])
+    res = await _ocr_advance(
+        sandbox_id, job_id,
+        src_pdf=src_pdf, pages=str(pages), dpi=int(dpi), batch_pages=bp,
+        wait_seconds=wait_seconds, t0=t0,
+    )
+    if isinstance(res, dict):
+        res.setdefault("job_id", job_id)
+        res.setdefault("sandbox_id", sandbox_id)
+    return res
+
+
+async def _ocr_advance(
+    sandbox_id: str,
+    job_id: str,
+    *,
+    src_pdf: str,
+    pages: str,
+    dpi: int,
+    batch_pages: int,
+    wait_seconds: int,
+    t0: float,
+) -> dict:
+    """句柄任务的推进主体：S2 预检 → S3 分批规划 → S4 启动/轮询 → S5 收产物。
+
+    从 ocr_pdf_to_text 抽出（2026-10-22 句柄化）：ocr_pdf_to_text（提交，含
+    上传）与 ocr_status（续查，**零上传**）两条路径汇到这里，推进逻辑只写一份。
+    ★ 本函数绝不调用任何上传链路（upload * sandbox）——这是「续查不再重传」
+      的结构保证，将来任何改动引入上传都应视为破坏该保证（测试有 AST 锚点）。
+    """
+    import shlex
+    import asyncio as _asyncio
+    import time as _time
+
+    wait_seconds = max(0, min(_OCR_WAIT_MAX, int(wait_seconds)))
 
     # ── S2：沙箱是否具备 OCR 入口（旧模板会让模型重走"自己写脚本"的老路）──
     # ★ 必须 echo OK：本判据读的是 stdout 里有没有 OK，而 grep 命中的输出是
@@ -2578,6 +2698,58 @@ async def ocr_pdf_to_text(
             "OCR 执行失败（exit=%d）：%s" % (exit_code, (tail.get("stdout") or "").strip()[:300])
         )
     return await _settle(warnings)
+
+
+@mcp.tool()
+async def ocr_status(sandbox_id: str, job_id: str, wait_seconds: int = 300) -> dict:
+    """查询已提交 OCR 任务的进度/结果（用 ocr_pdf_to_text 返回的 job_id）。
+
+    **主要用于 agent 框架的自动续查**：ocr_pdf_to_text 返回 status="running" 时，
+    框架会自动带 job_id 反复调本工具直到任务完成 —— 模型侧一般无需手动调用。
+    若你确实要查进度（例如续查被预算中断后接手），把 running 结果里的
+    job_id + sandbox_id 原样传进来即可。
+
+    ★ 本工具**从不**上传文件、从不重启 OCR（除非沙箱内任务已死且无产物可复用，
+      此时按提交时的参数原样重启——与「同参数再调 ocr_pdf_to_text」等价，
+      但不再重传文件）。输入只在 ocr_pdf_to_text 提交时传一次。
+
+    Args:
+        sandbox_id: 提交时用的沙箱 ID（running 结果里有回显）。
+        job_id: ocr_pdf_to_text 返回的任务句柄（形如 ocrj-xxxxxxxxxxxx）。
+        wait_seconds: 本次最长等待秒数（0~300，默认 300）。未完成返回
+            status="running"，继续用**同一个 job_id** 再调即可。
+
+    Returns:
+        与 ocr_pdf_to_text 相同的结构（status/pages_*/payload_*/batch 等，
+        另含 job_id/sandbox_id 回显）。
+        job_id 不存在或沙箱已回收时 success=False（step="job"）——此时任务
+        已不可续接，请用**原参数**重新调用 ocr_pdf_to_text 重新提交。
+    """
+    import time as _time
+
+    if not _is_valid_sandbox_id(sandbox_id):
+        return _fail("validate", f"非法 sandbox_id: {sandbox_id!r}")
+    rec = await _ocr_job_load(sandbox_id, job_id)
+    if rec is None:
+        return _fail(
+            "job",
+            "任务句柄不存在或已失效（沙箱可能已被空闲回收）：job_id=%r。"
+            "请用**原参数**重新调用 ocr_pdf_to_text 重新提交任务。" % (job_id,),
+        )
+    res = await _ocr_advance(
+        sandbox_id, job_id,
+        src_pdf=str(rec.get("src_pdf") or ""),
+        pages=str(rec.get("pages") or "20"),
+        dpi=int(rec.get("dpi") or 150),
+        batch_pages=int(rec.get("batch_pages") or 0),
+        wait_seconds=wait_seconds,
+        # elapsed 从任务创建起算（不是本次调用）：模型/前端据此算剩余时间
+        t0=float(rec.get("created_at") or _time.time()),
+    )
+    if isinstance(res, dict):
+        res.setdefault("job_id", job_id)
+        res.setdefault("sandbox_id", sandbox_id)
+    return res
 
 
 async def _ocr_collect(

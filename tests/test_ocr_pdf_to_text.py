@@ -109,10 +109,16 @@ def test_tool_calls_sandbox_ocr_entry_not_own_impl():
     """必须复用 /opt/ocr/ocr_run.py，不得自己实现推理。"""
     src = _src()
     tree = ast.parse(src)
-    node = _func_node(tree, "ocr_pdf_to_text")
-    body = ast.get_source_segment(src, node)
-    assert "_OCR_ENTRY" in body, "工具未引用 _OCR_ENTRY（必须走沙箱封装）"
-    assert "upload_to_sandbox" in body, "工具未复用既有上传链路（DLP 解密在它里面）"
+    adv = _code_only(ast.get_source_segment(src, _func_node(tree, "_ocr_advance")))
+    submit = _code_only(ast.get_source_segment(src, _func_node(tree, "ocr_pdf_to_text")))
+    assert "_OCR_ENTRY" in adv, "推进主体未引用 _OCR_ENTRY（必须走沙箱封装）"
+    assert "upload_to_sandbox" in submit, "工具未复用既有上传链路（DLP 解密在它里面）"
+    # 2026-10-22 句柄化的结构保证：推进主体（submit 与 ocr_status 共用）
+    # 绝不出现上传 —— 这是「续查不重传」的落地形态，破坏它等于退回缺陷 1。
+    assert "upload_to_sandbox" not in adv, (
+        "_ocr_advance 里出现了上传调用——续查路径会重传文件，"
+        "句柄化保证被破坏（ocr_status 也走这条路）"
+    )
 
 
 def test_no_direct_ocr_library_import_in_tool():
@@ -203,12 +209,14 @@ def test_return_contract_fields():
     """返回值必须带 summary 字段且**不含全文**字段（262 页全文会撑爆上下文）。
 
     2026-10-19 submit-and-poll 改造后返回结构分两处：completed 契约在
-    _ocr_collect，running 契约在 ocr_pdf_to_text——并集检查。
+    _ocr_collect，running 契约在 _ocr_advance——并集检查。
+    2026-10-22 句柄化：running 契约整体挪进 _ocr_advance（submit 与
+    ocr_status 共用推进主体），另要求 job_id/sandbox_id 回显。
     """
     src = _src()
     tree = ast.parse(src)
     body = ""
-    for name in ("ocr_pdf_to_text", "_ocr_collect"):
+    for name in ("_ocr_advance", "_ocr_collect"):
         node = _func_node(tree, name)
         body += ast.get_source_segment(src, node) or ""
     for key in ("pages_total", "pages_ocred", "pages_failed", "total_texts",
@@ -216,6 +224,12 @@ def test_return_contract_fields():
         assert f'"{key}"' in body, f"返回契约缺 {key}"
     assert '"status"' in body, "submit-and-poll 契约缺 status 字段"
     assert '"progress_hint"' in body, "running 分支缺 progress_hint"
+    # 句柄回显：submit 与 ocr_status 两条路径都必须把 job_id 塞进返回
+    submit_seg = ast.get_source_segment(src, _func_node(tree, "ocr_pdf_to_text")) or ""
+    status_seg = ast.get_source_segment(src, _func_node(tree, "ocr_status")) or ""
+    for nm, seg in (("ocr_pdf_to_text", submit_seg), ("ocr_status", status_seg)):
+        assert 'setdefault("job_id"' in seg, f"{nm} 返回缺 job_id 回显（drive 拿不到句柄将退化成重传续查）"
+        assert 'setdefault("sandbox_id"' in seg, f"{nm} 返回缺 sandbox_id 回显"
     assert '"text"' not in body.replace('"texts"', ""), "返回值不应内联全文（会撑爆上下文）"
 
 
@@ -276,9 +290,10 @@ def test_background_launch_uses_done_flag_not_pid_liveness():
     2026-10-19 bgtest4 探针实锤：e2b 每次 execute 是独立 PID namespace，
     跨 execute 会话 kill -0 对已死进程恒报 ALIVE（自然退出 5s 后仍"活"），
     且镜像里 ps/pgrep 都没装。文件系统才是跨 namespace 的可靠信号源。
+    2026-10-22 句柄化：判活/启动逻辑已随推进主体挪进 _ocr_advance。
     """
     src = _src()
-    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    node = _func_node(ast.parse(src), "_ocr_advance")
     seg = _code_only(ast.get_source_segment(src, node))
     assert "done.flag" in seg, "后台任务必须写 done.flag 作为完成信号"
     assert "kill -0" not in seg, (
@@ -319,9 +334,10 @@ def test_fingerprint_guard_before_result_reuse():
 
     没有指纹门禁，pages="1-5" 之后用 pages="10-20" 续调会读到第一批的
     产物——语义错误比浪费一次 OCR 严重得多。
+    2026-10-22 句柄化：指纹门禁在推进主体 _ocr_advance 里。
     """
     src = _src()
-    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    node = _func_node(ast.parse(src), "_ocr_advance")
     seg = ast.get_source_segment(src, node)
     assert "fingerprint" in seg, "必须构造参数指纹"
     assert "prev_fp == fingerprint" in seg, (
@@ -347,8 +363,8 @@ def test_wait_loop_has_deadline_exit():
     """
     src = _src()
     tree = ast.parse(src)
-    node = _func_node(tree, "ocr_pdf_to_text")
-    assert node is not None
+    node = _func_node(tree, "_ocr_advance")
+    assert node is not None, "推进主体 _ocr_advance 未定义"
 
     guarded = []
     for sub in ast.walk(node):
@@ -389,7 +405,9 @@ def _load_ocr_module():
     摘进同一命名空间，返回可 await 调用的真函数——不 import main（重依赖）。"""
     src = _src()
     tree = ast.parse(src)
-    want_names = {"ocr_pdf_to_text", "_ocr_collect", "_fail", "_parse_page_spec",
+    want_names = {"ocr_pdf_to_text", "_ocr_advance", "ocr_status",
+                  "_ocr_job_id", "_ocr_job_save", "_ocr_job_load",
+                  "_ocr_collect", "_fail", "_parse_page_spec",
                   "_first_json_value", "_parse_ocr_progress", "_ocr_task_age_seconds",
                   "_bump_silent_streak", "_build_ocr_launch_cmd",
                   # 分批（方案 B，2026-10-20）
@@ -447,6 +465,9 @@ def _load_ocr_module():
     # 分批常量同样是 BinOp（`"%s/batches" % _OCR_WORKDIR`），literal_eval 吃不下
     ns["_OCR_BATCH_DIR"] = "%s/batches" % workdir
     ns["_OCR_BATCH_STATE"] = "%s/batches/state.json" % workdir
+    # 句柄常量同样是派生/非 literal（2026-10-22 方案 D）
+    ns["_OCR_JOBS_DIR"] = "%s/jobs" % workdir
+    ns["_OCR_JOB_ID_RE"] = re.compile(r"^ocrj-[0-9a-f]{12}$")
     # 下发动作在单测里用 stub 顶替（真实下发的测试见
     # test_ocr_runner_shipped_*，那里 mock 掉 _sandbox_write）。
     ns["_ensure_ocr_runner"] = _stub_ensure_runner
@@ -585,9 +606,10 @@ def test_fingerprint_check_precedes_done_flag_branch():
 
     防止"把 _read_fingerprint 挪回 if done_code is None 里"的回归——
     那正是 T4 IndexError 的结构性根因（flag 在就永不验指纹）。
+    2026-10-22 句柄化：顺序锚点随推进主体挪到 _ocr_advance。
     """
     src = _src()
-    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    node = _func_node(ast.parse(src), "_ocr_advance")
     seg = _code_only(ast.get_source_segment(src, node))
     i_fp = seg.find("prev_fp = await _read_fingerprint()")
     i_branch = seg.find("if done_code is None:")
@@ -625,9 +647,10 @@ def test_cleanup_and_launch_are_separate_commands():
 
     沙箱 A/B（_bg_ab2_inner.py，真实 OCR 命令）：`&&` 链 25s 卡满被 Timeout
     杀；拆开后 0.0s 返回 BG_STARTED，python3 存活并在真跑。
+    2026-10-22 句柄化：清场/启动调用点随推进主体挪到 _ocr_advance。
     """
     src = _src()
-    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "ocr_pdf_to_text")))
+    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "_ocr_advance")))
     assert "mkdir -p %s; rm -f %s %s %s" in seg, (
         "清场命令必须用 `;` 分隔（mkdir ...; rm -f ...）——用 `&&` 会把后续命令"
         "串成 and-list 一起被后台化，commands.run 卡到超时并杀死 OCR"
@@ -651,9 +674,10 @@ def test_launch_visibility_probe_exists():
 
     否则就是 add0229b 的静默：工具连回 5 次 status=running + pages_ocred=0，
     模型判定卡死 → 换策略解析文本层 → 最终被循环检测硬停。
+    2026-10-22 句柄化：启动探针随推进主体挪到 _ocr_advance。
     """
     src = _src()
-    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "ocr_pdf_to_text")))
+    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "_ocr_advance")))
     assert "BG_STARTED" in seg
     assert "_OCR_LAUNCH_PROBE_TRIES" in seg, "缺少启动探针轮次常量"
     assert 'return _fail(\n                    "launch"' in seg or '"launch",' in seg, \
@@ -1102,9 +1126,10 @@ def test_result_reuse_requires_nonempty_file():
     `python3 ... > result.json` 在命令启动瞬间就创建了 0 字节文件，用
     `test -f` 会把"正在跑"误判成"有产物"⇒ 复用空文件 ⇒ _fail("read")
     （2026-10-20 e2e T2/T3 实锤：T1 用 wait_seconds=5 提前返回后 T2 立刻续查）。
+    2026-10-22 句柄化：复用判定随推进主体挪到 _ocr_advance。
     """
     src = _src()
-    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "ocr_pdf_to_text")))
+    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "_ocr_advance")))
     assert "test -s %s && echo OK" in seg, "复用判定必须用 test -s（非空文件）"
     assert 'test -f %s && echo OK" % shlex.quote(out_json)' not in seg, (
         "不得用 test -f 判 result.json——空文件也会通过，把进行中的任务当成已完成"
@@ -1115,9 +1140,10 @@ def test_liveness_gate_precedes_restart():
     """判活闸门必须存在且先于启动：err.log mtime 新鲜 ⇒ 不重启。
 
     否则续查会清场重启，把正在写的 result.json unlink 掉（结果全丢）。
+    2026-10-22 句柄化：判活闸门随推进主体挪到 _ocr_advance。
     """
     src = _src()
-    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "ocr_pdf_to_text")))
+    seg = _code_only(ast.get_source_segment(src, _func_node(ast.parse(src), "_ocr_advance")))
     assert "_ocr_task_age_seconds" in seg, "缺少 mtime 判活探针"
     assert "_OCR_LIVENESS_SEC" in seg, "缺少判活窗口常量"
     i_age = seg.find("_ocr_task_age_seconds")
@@ -2014,9 +2040,10 @@ def test_non_batch_artifacts_no_longer_share_root_result_json():
 
     只测 `_ocr_segment_dir` 会漏掉「算出来但没用上」——本项目已有先例
     （1.0.16 拆了子 PDF 却忘了 mv 到批目录，三批全 FileNotFoundError）。
+    2026-10-22 句柄化：产物路径计算随推进主体挪到 _ocr_advance。
     """
     src = _src()
-    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    node = _func_node(ast.parse(src), "_ocr_advance")
     body = ast.get_source_segment(src, node) or ""
     for name in ("out_json", "out_err", "out_done", "out_meta"):
         assert '"%%s/%s" %% seg_dir' % {
@@ -2025,3 +2052,186 @@ def test_non_batch_artifacts_no_longer_share_root_result_json():
         }[name] in body, "非分批路径的 %s 仍指向根目录" % name
     # 清场与 mkdir 也必须用同一目录，否则新目录不会被创建
     assert "batch_dir or seg_dir or _OCR_WORKDIR" in body
+
+
+# ────────── 任务句柄化（2026-10-22 方案 D，对照 deer-flow tasks 契约）──────────
+
+job_id_fn = _load_func("_ocr_job_id")
+
+
+def test_ocr_job_id_deterministic():
+    """句柄必须由规范参数决定：同参同句柄（幂等），异参异句柄（不串任务）。"""
+    a = job_id_fn("sbx-1", "/home/user/_ocr/a.pdf", "1-5", 150, 40)
+    b = job_id_fn("sbx-1", "/home/user/_ocr/a.pdf", "1-5", 150, 40)
+    c = job_id_fn("sbx-1", "/home/user/_ocr/a.pdf", "6-9", 150, 40)
+    d = job_id_fn("sbx-2", "/home/user/_ocr/a.pdf", "1-5", 150, 40)
+    e = job_id_fn("sbx-1", "/home/user/_ocr/a.pdf", "1-5", 150, 0)  # 未归一化的 0
+    assert a == b, "同参数必须得到同一句柄（重复提交幂等）"
+    assert a != c and a != d, "不同 pages/sandbox 必须得到不同句柄"
+    assert a != e, "batch_pages=0 必须在调用方归一化后再算句柄，否则同任务裂成两个"
+
+
+def test_ocr_job_id_format_gate():
+    """句柄格式必须是 ocrj-+12位hex——_ocr_job_load 拼路径前的防注入闸门。"""
+    import importlib as _il
+    assert re.fullmatch(r"ocrj-[0-9a-f]{12}", job_id_fn("sbx", "/x.pdf", "all", 150, 40))
+    # 闸门常量必须存在且被 _ocr_job_load 在拼路径前使用（AST 顺序锚点）
+    src = _src()
+    m = re.search(r"^_OCR_JOB_ID_RE\s*=\s*re\.compile\(", src, re.M)
+    assert m, "缺少 _OCR_JOB_ID_RE 格式闸门常量"
+    node = _func_node(ast.parse(src), "_ocr_job_load")
+    seg = _code_only(ast.get_source_segment(src, node))
+    i_gate = seg.find("_OCR_JOB_ID_RE.match")
+    i_path = seg.find("path = ")
+    assert i_gate != -1 and i_path != -1 and i_gate < i_path, (
+        "_ocr_job_load 必须先过句柄格式闸门再拼路径（job_id 来自模型，是注入面）"
+    )
+
+
+def test_ocr_status_tool_registered_and_fails_closed():
+    """ocr_status 必须注册为 MCP 工具；句柄不存在时显式失败（step=job）。"""
+    src = _src()
+    tree = ast.parse(src)
+    node = _func_node(tree, "ocr_status")
+    assert node is not None, "ocr_status 未定义"
+    decs = [ast.unparse(d.func) if isinstance(d, ast.Call) else ast.unparse(d)
+            for d in node.decorator_list]
+    assert "mcp.tool" in decs, f"ocr_status 缺少 @mcp.tool()（不进 tool list 框架就用不了）"
+    seg = _code_only(ast.get_source_segment(src, node))
+    assert "_ocr_job_load" in seg, "ocr_status 必须经 _ocr_job_load 读句柄记录"
+    assert '"job"' in seg, "句柄不存在必须返回 step=job 的显式错误（不是含糊的失败）"
+    assert "重新调用 ocr_pdf_to_text" in seg, "错误文案必须指引模型重新提交"
+    assert "upload_to_sandbox" not in seg, "ocr_status 是纯查询，绝不能出现上传"
+    # ocr_status 的推进必须经 _ocr_advance（唯一推进主体），不得复制一份逻辑
+    assert "_ocr_advance" in seg, "ocr_status 必须复用 _ocr_advance（两套推进逻辑必然分叉）"
+
+
+def test_submit_normalizes_batch_pages_before_job_id():
+    """batch_pages 必须先归一化再算句柄：传 0（自动）与显式 40 指向同一任务。"""
+    src = _src()
+    node = _func_node(ast.parse(src), "ocr_pdf_to_text")
+    seg = _code_only(ast.get_source_segment(src, node))
+    i_norm = seg.find("bp = max(1, min(bp, _OCR_BATCH_PAGES_MAX))")
+    i_job = seg.find("job_id = _ocr_job_id(")
+    assert i_norm != -1 and i_job != -1 and i_norm < i_job, (
+        "必须先归一化 batch_pages 再计算 job_id——否则传 0 与传 40 裂成两个任务"
+    )
+    assert "_ocr_job_save" in seg, "submit 必须落句柄记录（MCP 无状态，映射只能存沙箱）"
+    assert "_ocr_advance" in seg, "submit 必须经 _ocr_advance 推进（唯一推进主体）"
+
+
+class _JobFlowSandbox:
+    """submit → status 两段式流程桩：验证续查全程零上传、零重启。"""
+
+    def __init__(self):
+        self.commands: list[str] = []
+        self.writes: dict[str, bytes] = {}
+        self.meta = ""
+        self.started = False
+        self.launches = 0
+        self.result_json = json.dumps([{"page": 1, "ok": True, "texts": ["TXT-1"]}])
+
+    async def run(self, sandbox_id, cmd, timeout=None):
+        self.commands.append(cmd)
+        if "grep -m1" in cmd:  # S2 环境预检
+            return {"success": True, "stdout": '__version__ = "1.1.0"\nOK\n', "stderr": ""}
+        if cmd.endswith("python3 /home/user/_ocr/_page.py /home/user/_ocr/e2e.pdf"):
+            return {"success": True, "stdout": "1\n", "stderr": ""}  # 页数探测
+        if "_page.py /home/user/_ocr/e2e.pdf 0" in cmd:
+            return {"success": True, "stdout": "SPLIT_OK\n", "stderr": ""}  # 拆页
+        if cmd.startswith("cat ") and "/jobs/" in cmd and cmd.rstrip().endswith(".json 2>/dev/null"):
+            path = cmd[4:].split(" 2>/dev/null")[0].strip()
+            raw = self.writes.get(path)
+            return {"success": True, "stdout": (raw.decode("utf-8") if raw else "") + "\n", "stderr": ""}
+        if cmd.startswith("cat ") and "ocr.meta" in cmd:
+            return {"success": True, "stdout": self.meta + "\n", "stderr": ""}
+        if cmd.startswith("cat ") and "done.flag" in cmd:
+            return {"success": True, "stdout": ("0" if self.started else "") + "\n", "stderr": ""}
+        if "BG_STARTED" in cmd:
+            self.started = True
+            self.launches += 1
+            return {"success": True, "stdout": "BG_STARTED\n", "stderr": ""}
+        if "wc -c <" in cmd:
+            return {"success": True, "stdout": "48\n", "stderr": ""}
+        if "LINKED" in cmd or "COPIED" in cmd:
+            return {"success": True, "stdout": "LINKED\n", "stderr": ""}
+        if cmd.startswith("test -f ") and "result.json" in cmd:
+            return {"success": True, "stdout": "OK\n", "stderr": ""}
+        if cmd.startswith("test -f /home/user/_ocr/e2e.pdf"):
+            return {"success": True, "stdout": "OK\n", "stderr": ""}
+        return {"success": True, "stdout": "", "stderr": ""}
+
+    async def write(self, sandbox_id, path, data):
+        self.writes[path] = bytes(data)
+        if path.endswith("ocr.meta"):
+            self.meta = bytes(data).decode("utf-8")
+        return {"success": True, "error": None}
+
+    async def read(self, sandbox_id, path):
+        return {"success": True, "data": self.result_json.encode(), "error": None}
+
+
+def test_submit_then_status_roundtrip_without_reupload():
+    """句柄化核心行为：submit 拿 job_id → ocr_status 续查完成，全程零重启。
+
+    deer-flow 同构（status 只传 task_id）：status 调用绝不触发 BG_STARTED，
+    也不再需要任何文件参数。这是「每轮重传 256MB」缺陷的结构性终结。
+    """
+    import asyncio as _asyncio
+
+    ns = _load_ocr_module()
+    sb = _JobFlowSandbox()
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+
+    r1 = _asyncio.run(ns["ocr_pdf_to_text"](
+        sandbox_id="sbx-test",
+        sandbox_pdf_path="/home/user/_ocr/e2e.pdf",
+        pages="1", dpi=150, wait_seconds=3,
+    ))
+    assert r1["success"] and r1["status"] == "completed", r1
+    jid = r1.get("job_id")
+    assert jid and re.fullmatch(r"ocrj-[0-9a-f]{12}", jid), r1
+    assert r1.get("sandbox_id") == "sbx-test"
+    n_after_submit = len(sb.commands)
+    assert sb.launches == 1, "submit 应恰好启动一次"
+
+    r2 = _asyncio.run(ns["ocr_status"](
+        sandbox_id="sbx-test", job_id=jid, wait_seconds=3,
+    ))
+    assert r2["success"] is True, r2
+    assert r2["status"] == "completed", r2
+    assert r2["job_id"] == jid, "status 返回必须回显同一句柄"
+    assert r2.get("total_texts") == 1, r2
+    assert sb.launches == 1, (
+        "ocr_status 续查绝不重启 OCR 任务（指纹一致时）——重启 = 重传缺陷还魂"
+    )
+    assert len(sb.commands) > n_after_submit, "status 必须真实查询沙箱（不是空转）"
+
+
+def test_status_unknown_job_fails_with_resubmit_guidance():
+    """句柄不存在（沙箱被回收/拼错）必须显式失败并指引重新提交，不能挂死。"""
+    import asyncio as _asyncio
+
+    ns = _load_ocr_module()
+    sb = _JobFlowSandbox()
+    ns["_sandbox_run"] = sb.run
+    ns["_sandbox_write"] = sb.write
+    ns["_sandbox_read"] = sb.read
+    ns["_is_valid_sandbox_id"] = lambda sid: True
+
+    r = _asyncio.run(ns["ocr_status"](
+        sandbox_id="sbx-test", job_id="ocrj-000000000000", wait_seconds=3,
+    ))
+    assert r["success"] is False, r
+    assert r["step"] == "job", r
+    assert "重新调用 ocr_pdf_to_text" in (r["error"] or ""), r
+
+    # 注入面：非法格式句柄必须被闸门拦下（不拼路径、不进沙箱命令）
+    r2 = _asyncio.run(ns["ocr_status"](
+        sandbox_id="sbx-test", job_id="../../etc/passwd", wait_seconds=3,
+    ))
+    assert r2["success"] is False and r2["step"] == "job", r2
+    assert not any("passwd" in c for c in sb.commands), "非法句柄绝不能进入沙箱命令"
